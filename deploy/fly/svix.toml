@@ -10,7 +10,7 @@
 # Required secrets (see DEPLOY-FLY.md):
 #   SVIX_JWT_SECRET, SVIX_DB_DSN, SVIX_REDIS_DSN
 app = "open-wearables-svix"
-primary_region = "syd"
+primary_region = "iad"
 
 [build]
   image = "svix/svix-server:v1"
@@ -18,19 +18,26 @@ primary_region = "syd"
 [env]
   SVIX_QUEUE_TYPE = "redis"
   SVIX_CACHE_TYPE = "redis"
-  # The container's default command runs migrations + server. We override the
-  # entrypoint-provided "--run-migrations" via experimental.cmd below.
+  # Must bind all interfaces or fly-proxy can't reach it (default is localhost).
+  SVIX_LISTEN_ADDRESS = "0.0.0.0:8071"
+  # Fly's experimental.cmd replaces the image command outright (the entrypoint
+  # is not prepended), so the binary name must be included explicitly.
 
 [experimental]
-  cmd = ["--run-migrations"]
+  cmd = ["svix-server", "--run-migrations"]
 
 # Internal-only: expose over the private network (.flycast), no public IP.
 [[services]]
   internal_port = 8071
   protocol = "tcp"
-  auto_stop_machines = "stop"
+  auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
+
+  # Without an explicit port, fly-proxy exposes nothing on the flycast IP.
+  [[services.ports]]
+    port = 8071
+    handlers = []
 
 [[vm]]
   size = "shared-cpu-1x"
