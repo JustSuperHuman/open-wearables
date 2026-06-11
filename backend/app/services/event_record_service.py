@@ -128,11 +128,11 @@ class EventRecordService(
         if record is not None and record.data_source_id is not None:
             data_source = db_session.get(DataSource, record.data_source_id)
             if data_source is not None:
-                _record, _data_source, _detail = record, data_source, detail
-
-                @sa_event.listens_for(db_session, "after_commit", once=True)
-                def _dispatch_webhook(session: DbSession) -> None:  # noqa: ARG001
-                    self._emit_event_record_webhook(_record, _data_source, _detail)
+                # repo.create() has already committed the detail, so emit now.
+                # An after_commit listener here would only fire on a LATER commit
+                # of this session — which never comes for the last record of a
+                # sync, silently dropping its workout.created event.
+                self._emit_event_record_webhook(record, data_source, detail)
 
         return result  # ty:ignore[invalid-return-type]
 
