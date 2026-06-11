@@ -104,6 +104,27 @@ class TestEventRecordServiceCreateDetail:
         assert getattr(detail, "heart_rate_min", None) is None
         assert getattr(detail, "steps_count", None) is None
 
+    def test_create_detail_emits_workout_webhook_immediately(self, db: Session) -> None:
+        """Should emit workout.created without waiting for a later session commit."""
+        data_source = DataSourceFactory(source="garmin", provider="garmin")
+        event_record = EventRecordFactory(mapping=data_source, category="workout", type_="running")
+        detail_payload = EventRecordDetailCreate(
+            record_id=event_record.id,
+            energy_burned=Decimal("300.0"),
+            distance=Decimal("5000.0"),
+        )
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_workout_created") as mock_workout,
+        ):
+            event_record_service.create_detail(db, detail_payload)
+
+        mock_workout.assert_called_once()
+        assert mock_workout.call_args.kwargs["record_id"] == event_record.id
+        assert mock_workout.call_args.kwargs["user_id"] == data_source.user_id
+        assert mock_workout.call_args.kwargs["provider"] == "garmin"
+
 
 class TestEventRecordServiceBulkCreateDetails:
     """bulk_create_details must dispatch a webhook per detail on commit.
