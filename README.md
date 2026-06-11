@@ -16,6 +16,14 @@
 
 **Documentation**: https://openwearables.io/docs
 
+## Production Deployment
+
+JustGains runs Open Wearables at:
+
+- **Developer portal**: https://app.wearables.justgains.com
+- **API**: https://api.wearables.justgains.com
+- **Celery Flower**: https://flower.wearables.justgains.com
+
 ---
 
 Open-source platform that unifies wearable device data from multiple providers and enables AI-powered health insights through natural language automations. Build health applications faster with a single API, embeddable widgets, and intelligent webhook notifications.

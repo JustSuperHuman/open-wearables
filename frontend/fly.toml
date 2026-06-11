@@ -1,0 +1,32 @@
+# Fly.io config for the Open Wearables frontend (Nitro node server on :3000).
+#
+# IMPORTANT: VITE_API_URL is baked in at BUILD time (see Dockerfile ARG), so it
+# must be passed as a build arg here — NOT a runtime secret. Point it at the
+# deployed API's public URL.
+#
+# First time:   fly launch --no-deploy --copy-config --name open-wearables-frontend
+# Deploy:       fly deploy --build-arg VITE_API_URL=https://open-wearables-api.fly.dev
+app = "open-wearables-frontend"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  [build.args]
+    VITE_API_URL = "https://wearables.api.justgains.com"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "3000"
+  HOST = "0.0.0.0"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
