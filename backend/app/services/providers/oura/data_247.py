@@ -717,7 +717,7 @@ class Oura247Data(Base247DataTemplate):
 
             for interval_data, series_type, action in (
                 (hr, SeriesType.heart_rate, "oura_sleep_hr_save_error"),
-                (hrv, SeriesType.heart_rate_variability_sdnn, "oura_hrv_save_error"),
+                (hrv, SeriesType.heart_rate_variability_rmssd, "oura_hrv_save_error"),
             ):
                 if not (interval_data and interval_data.timestamp and interval_data.interval and interval_data.items):
                     continue
