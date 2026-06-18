@@ -822,6 +822,22 @@ class Garmin247Data(Base247DataTemplate):
                 )
             )
 
+        # Skeletal muscle mass (convert grams to kg)
+        muscle_mass_grams = raw_body_comp.get("muscleMassInGrams")
+        if muscle_mass_grams:
+            samples.append(
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    source=self.provider_name,
+                    recorded_at=recorded_at,
+                    zone_offset=zone_offset,
+                    value=Decimal(str(muscle_mass_grams)) / 1000,  # Convert to kg
+                    series_type=SeriesType.skeletal_muscle_mass,
+                    external_id=summary_id,
+                )
+            )
+
         return samples
 
     def save_body_composition(
@@ -954,7 +970,7 @@ class Garmin247Data(Base247DataTemplate):
             category="workout",
             type=activity_type.lower(),
             source_name="Garmin",
-            device_model=raw_activity.get("deviceId"),
+            device_model=raw_activity.get("deviceName"),
             duration_seconds=duration,
             start_datetime=start_dt,
             end_datetime=end_dt,
@@ -1320,12 +1336,15 @@ class Garmin247Data(Base247DataTemplate):
     ) -> list[TimeSeriesSampleCreate]:
         """Build time series samples from blood pressure data (no DB interaction)."""
         samples: list[TimeSeriesSampleCreate] = []
-        measurement_ts = raw_bp.get("measurementTimestampGMT", 0)
+        # Garmin's bloodPressures webhook carries the timestamp as
+        # measurementTimeInSeconds (same as bodyComps). Fall back to the
+        # legacy field names for safety.
+        measurement_ts = (
+            raw_bp.get("measurementTimeInSeconds")
+            or raw_bp.get("measurementTimestampGMT")
+            or raw_bp.get("startTimeInSeconds", 0)
+        )
         summary_id = raw_bp.get("summaryId")
-
-        # Try alternative timestamp field
-        if not measurement_ts:
-            measurement_ts = raw_bp.get("startTimeInSeconds", 0)
 
         if not measurement_ts:
             return samples
@@ -1753,14 +1772,16 @@ class Garmin247Data(Base247DataTemplate):
 
         return record, detail
 
-    def _save_segments(
+    def _save_fit_workout_fields(
         self,
         db: DbSession,
         user_id: UUID,
         activity_id: str,
         segments: list[dict],
+        hr_zones: dict | None = None,
+        power_zones: dict | None = None,
     ) -> None:
-        """Update workout_details.segments for the event_record matching activity_id.
+        """Update workout_details fields derived from the FIT file.
 
         No-op if the event_record doesn't exist yet (activityFiles arrived before
         activityDetails). activityDetails is always processed first within the same
@@ -1771,14 +1792,19 @@ class Garmin247Data(Base247DataTemplate):
             log_structured(
                 self.logger,
                 "warning",
-                "No event_record found for activityFiles — segments not saved",
+                "No event_record found for activityFiles — FIT workout fields not saved",
                 provider="garmin",
-                task="_save_segments",
+                task="_save_fit_workout_fields",
                 user_id=str(user_id),
                 activity_id=activity_id,
             )
             return
-        self.event_record_detail_repo.update_workout_fields(db, record.id, {"segments": segments})
+        fields: dict = {"segments": segments}
+        if hr_zones is not None:
+            fields["hr_zones"] = hr_zones
+        if power_zones is not None:
+            fields["power_zones"] = power_zones
+        self.event_record_detail_repo.update_workout_fields(db, record.id, fields)
 
     # -------------------------------------------------------------------------
     # Batch Processing (for webhook handlers)
@@ -1861,7 +1887,7 @@ class Garmin247Data(Base247DataTemplate):
                             all_records.append(record)
                             all_workout_details.append(detail)
                     case "activityDetails":
-                        # activityDetails items nest summary data one level deeper
+                        # activityDetails items nest summary data one level deeper.
                         result = self._build_activity_record(user_id, item.get("summary", {}))
                         if result:
                             record, detail = result
@@ -1933,14 +1959,21 @@ class Garmin247Data(Base247DataTemplate):
                                 error=str(e),
                             )
                             continue
-                        if fit_result.segments:
+                        if fit_result.segments or fit_result.hr_zones or fit_result.power_zones:
                             try:
-                                self._save_segments(db, user_id, activity_id, fit_result.segments)
+                                self._save_fit_workout_fields(
+                                    db,
+                                    user_id,
+                                    activity_id,
+                                    fit_result.segments,
+                                    hr_zones=fit_result.hr_zones.model_dump() if fit_result.hr_zones else None,
+                                    power_zones=fit_result.power_zones.model_dump() if fit_result.power_zones else None,
+                                )
                             except Exception as e:
                                 log_structured(
                                     self.logger,
                                     "warning",
-                                    "Failed to save segments",
+                                    "Failed to save FIT workout fields",
                                     provider="garmin",
                                     task="process_items_batch",
                                     user_id=str(user_id),
