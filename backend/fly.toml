@@ -9,7 +9,7 @@
 # own public 443. Svix runs as its own app too (deploy/fly/svix.toml).
 #
 # First time:   fly launch --no-deploy --copy-config --name open-wearables-api
-# Deploy:       fly deploy
+# Deploy:       fly deploy --env API_BASE_URL=https://open-wearables-api.fly.dev
 app = "open-wearables-api"
 primary_region = "iad"
 
@@ -19,21 +19,17 @@ primary_region = "iad"
 [env]
   ENVIRONMENT = "production"
   API_PORT = "8000"
-  API_BASE_URL = "https://wearables.api.justgains.com"
+  API_BASE_URL = "https://open-wearables-api.fly.dev"
   # Point at the internal Redis app (deploy/fly/redis.toml) over Fly 6PN private
   # DNS. Overrides REDIS_HOST=redis from .env (which is docker-compose-local only).
   REDIS_HOST = "open-wearables-redis.internal"
   # The image installs the app into the venv via `uv sync --no-editable`, so the
-  # running module lives in site-packages and pydantic would look for the .env at
-  # site-packages/config/.env (wrong). Putting the source tree on PYTHONPATH makes
-  # `import app` resolve to /root_project/app, so config.py finds the real
-  # /root_project/config/.env (baked in from backend/config/.env at build time).
+  # running module lives in site-packages. Putting the source tree on PYTHONPATH
+  # makes `import app` resolve to /root_project/app.
   PYTHONPATH = "/root_project"
-  # All app secrets (DB_HOST/USER/PASSWORD/NAME, REDIS_*, SECRET_KEY, MASTER_KEY,
-  # STRAVA_*, etc.) are baked in from backend/config/.env (loaded by pydantic at
-  # runtime). Container env vars above OVERRIDE the .env file values, so we only
-  # set infra-level vars here. DB_*/REDIS_* are intentionally NOT overridden so
-  # the external DB/Redis from .env are used as-is.
+  # Set DB_*, SECRET_KEY, MASTER_KEY, provider OAuth credentials, Sentry, and
+  # other sensitive values with `fly secrets set`; backend/config/.env is
+  # intentionally excluded from Docker builds.
 
 # NOTE: app.sh runs `alembic upgrade head` + seeds on every web boot, so
 # migrations happen automatically on the web process. That's fine for a single
@@ -43,8 +39,8 @@ primary_region = "iad"
 #   [deploy]
 #     release_command = "scripts/start/release.sh"
 
-# Redis is provided by the internal open-wearables-redis app (REDIS_HOST override
-# above), so worker/beat can run against the broker.
+# Redis is provided by the internal open-wearables-redis app (REDIS_HOST above),
+# so worker/beat can run against the broker.
 [processes]
   web    = "scripts/start/app.sh"
   worker = "scripts/start/worker.sh"

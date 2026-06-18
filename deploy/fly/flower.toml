@@ -21,9 +21,9 @@ primary_region = "iad"
 [env]
   ENVIRONMENT = "production"
   # Reuses the backend image, so it needs the same overrides as backend/fly.toml:
-  # PYTHONPATH so pydantic finds the baked-in /root_project/config/.env, and
-  # REDIS_HOST pointing at the internal Redis (the broker Flower monitors).
-  # DB_*/REDIS_PORT are intentionally NOT set so the .env values win.
+  # PYTHONPATH so imports resolve from /root_project/app, and REDIS_HOST pointing
+  # at the internal Redis app (the broker Flower monitors).
+  # Set DB_*, SECRET_KEY, and other sensitive values with `fly secrets set`.
   PYTHONPATH = "/root_project"
   REDIS_HOST = "open-wearables-redis.internal"
 

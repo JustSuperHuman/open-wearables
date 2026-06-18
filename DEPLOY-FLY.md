@@ -1,173 +1,255 @@
 # Deploying Open Wearables to Fly.io
 
-Fly.io does **not** run `docker-compose.yml`. Each service is deployed as its own
-Fly app (or as a process group within an app) using a `fly.toml`. This guide maps
-the compose stack onto Fly and gives the exact command sequence.
-
-## Architecture on Fly
+Fly.io does not run `docker-compose.yml` directly. This setup maps the compose
+stack to Fly apps:
 
 | Compose service | Fly resource | Notes |
 |---|---|---|
-| `db` (postgres:18) | **Fly Managed Postgres** | Managed cluster, not self-hosted |
-| `redis` (redis:8) | **Upstash Redis** (`fly redis create`) | Managed, private-network URL |
-| `app` | `open-wearables-api` — process `web` | Public, :8000 |
-| `celery-worker` | `open-wearables-api` — process `worker` | Same image, no ports |
-| `celery-beat` | `open-wearables-api` — process `beat` | Same image, no ports |
-| `flower` | `open-wearables-flower` | Separate app, same image, public + basic auth |
-| `svix-server` | `open-wearables-svix` | Separate app, internal-only (`.flycast`) |
-| `frontend` | `open-wearables-frontend` | Nitro node server, :3000 |
+| `db` | Fly Managed Postgres | Managed cluster |
+| `redis` | `open-wearables-redis` | Internal Redis app, private 6PN only |
+| `app` | `open-wearables-api` process `web` | Public FastAPI app on `:8000` |
+| `celery-worker` | `open-wearables-api` process `worker` | Same backend image |
+| `celery-beat` | `open-wearables-api` process `beat` | Same backend image |
+| `flower` | `open-wearables-flower` | Public Celery dashboard with basic auth |
+| `svix-server` | `open-wearables-svix` | Internal webhook server on `.flycast` |
+| `frontend` | `open-wearables-frontend` | Nitro server on `:3000` |
 
 Config files in this repo:
-- `backend/fly.toml` — API + worker + beat (process groups)
-- `deploy/fly/flower.toml` — Flower
-- `deploy/fly/svix.toml` — Svix
-- `frontend/fly.toml` — frontend
 
-> Set `primary_region` in each toml to your closest region (`fly platform regions`
-> to list). They default to `syd`.
-
----
+- `backend/fly.toml` - API, worker, and beat process groups
+- `frontend/fly.toml` - frontend Nitro server
+- `deploy/fly/redis.toml` - internal Redis
+- `deploy/fly/flower.toml` - Flower
+- `deploy/fly/svix.toml` - Svix
+- `deploy.ts` - optional Bun helper for deploying components in order
 
 ## 0. Prerequisites
 
 ```bash
-# Install flyctl, then:
 fly auth login
+bun --version
 ```
 
----
+The examples below use the default app prefix `open-wearables` and region `iad`.
+Override them without editing tracked files:
+
+```bash
+export FLY_APP_PREFIX=my-wearables
+export FLY_REGION=iad
+export FLY_ORG=my-fly-org
+export FLY_API_URL=https://api.example.com
+export FLY_FRONTEND_URL=https://app.example.com
+```
+
+`deploy.ts` automatically loads `.env.fly.local` when present. That file is
+ignored by git, so production app names, organization, domains, and other
+deployment-specific values can stay local:
+
+```bash
+FLY_ORG=my-fly-org
+FLY_REGION=iad
+FLY_API_URL=https://api.example.com
+FLY_FRONTEND_URL=https://app.example.com
+```
+
+Set `FLY_ENV_FILE=/path/to/env-file` to load a different file. Shell environment
+variables always take precedence over file values.
+
+You can also override individual app names:
+
+```bash
+export FLY_API_APP=my-wearables-api
+export FLY_FRONTEND_APP=my-wearables-frontend
+export FLY_FLOWER_APP=my-wearables-flower
+export FLY_REDIS_APP=my-wearables-redis
+export FLY_SVIX_APP=my-wearables-svix
+```
+
+Local files such as `.env.fly.local` are ignored by git, so private deployment
+values can live outside the open-source branch.
 
 ## 1. Managed Postgres
 
 ```bash
-fly mpg create --name open-wearables-db --region syd
+fly mpg create --name open-wearables-db --region iad
 ```
 
-Note the connection details. The backend builds its DSN from individual vars
-(`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`), so capture each.
-The connecting user needs `CREATEDB` — `scripts/start/app.sh` creates a separate
-`svix` database on the same cluster via `create_svix_db.py`.
+Save the generated host, port, database, user, and password. The backend expects
+individual database variables:
 
----
+- `DB_HOST`
+- `DB_PORT`
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
 
-## 2. Upstash Redis
+The database user must be able to create the `svix` database. The backend startup
+script runs `scripts/init/create_svix_db.py` before starting the API.
+
+## 2. Internal Redis
+
+Deploy the private Redis app:
 
 ```bash
-fly redis create --name open-wearables-redis --region syd
-fly redis status open-wearables-redis   # shows the private redis:// URL + password
+bun run deploy redis
 ```
 
-The URL looks like `redis://default:<password>@fly-open-wearables-redis.upstash.io:6379`.
-Capture the host and password — the app builds the URL from `REDIS_HOST`,
-`REDIS_PORT`, `REDIS_USERNAME` (`default`), `REDIS_PASSWORD`.
+By default the backend reaches Redis at:
 
-> The app's `redis_url` builder emits a plain `redis://` URL (no TLS). Fly's
-> Upstash Redis is reachable over the private network without TLS, so this works.
-
----
-
-## 3. Backend app (web + worker + beat)
-
-```bash
-cd backend
-fly launch --no-deploy --copy-config --name open-wearables-api
+```text
+open-wearables-redis.internal:6379
 ```
 
-Set secrets (single command):
+If you use a managed Redis instead, skip `bun run deploy redis` and set
+`REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, and `REDIS_SSL`
+on the API and Flower apps with `fly secrets set`.
+
+## 3. Backend Secrets
+
+Set the required backend secrets:
 
 ```bash
 fly secrets set -a open-wearables-api \
-  DB_HOST=<mpg-host> DB_USER=<mpg-user> DB_PASSWORD=<mpg-password> \
-  REDIS_HOST=fly-open-wearables-redis.upstash.io REDIS_USERNAME=default REDIS_PASSWORD=<redis-password> \
+  DB_HOST=<postgres-host> DB_PORT=5432 DB_NAME=open-wearables \
+  DB_USER=<postgres-user> DB_PASSWORD=<postgres-password> \
   SECRET_KEY="$(openssl rand -hex 32)" \
-  ADMIN_EMAIL=admin@yourdomain.com ADMIN_PASSWORD="$(openssl rand -hex 16)" \
+  ADMIN_EMAIL=admin@example.com ADMIN_PASSWORD="$(openssl rand -hex 16)" \
   SVIX_JWT_SECRET="$(openssl rand -hex 32)"
 ```
 
-Also copy any provider/API credentials from `backend/config/.env.example`
-(OAuth client IDs/secrets, Sentry DSN, S3/FIT settings, etc.) into `fly secrets set`.
-**Do not** commit `.env` or pass it as an env_file.
+Also set any provider credentials you need from `backend/config/.env.example`,
+such as `STRAVA_CLIENT_ID`, `STRAVA_CLIENT_SECRET`, Sentry, and S3/FIT settings.
 
-Deploy:
+Do not commit `.env` files. `backend/config/.env` is intentionally excluded from
+Docker builds; Fly should receive secrets through `fly secrets set`.
 
-```bash
-fly deploy        # builds backend/Dockerfile, starts web + worker + beat
-```
+## 4. Svix
 
-The API is now at `https://open-wearables-api.fly.dev`.
-
----
-
-## 4. Svix (webhook server, internal-only)
+Svix needs its own app and secrets. Use the same `SVIX_JWT_SECRET` value as the
+backend.
 
 ```bash
 fly apps create open-wearables-svix
 fly secrets set -a open-wearables-svix \
   SVIX_JWT_SECRET=<same-as-backend> \
-  SVIX_DB_DSN="postgresql://<mpg-user>:<mpg-password>@<mpg-host>:5432/svix" \
-  SVIX_REDIS_DSN="redis://default:<redis-password>@fly-open-wearables-redis.upstash.io:6379/1"
-fly deploy --config deploy/fly/svix.toml --image svix/svix-server:v1
+  SVIX_DB_DSN="postgresql://<postgres-user>:<postgres-password>@<postgres-host>:5432/svix" \
+  SVIX_REDIS_DSN="redis://open-wearables-redis.internal:6379/1"
+bun run deploy svix
 ```
 
-The backend reaches it at `http://open-wearables-svix.flycast:8071`. Point the
-backend's Svix server URL secret at that (check `.env.example` for the exact var
-name, e.g. `SVIX_SERVER_URL`):
+The backend reaches Svix at:
 
-```bash
-fly secrets set -a open-wearables-api SVIX_SERVER_URL="http://open-wearables-svix.flycast:8071"
+```text
+http://open-wearables-svix.flycast:8071
 ```
 
----
-
-## 5. Flower (public, basic auth)
+The deploy helper passes `SVIX_SERVER_URL` to the API app automatically. If you
+deploy manually, include it:
 
 ```bash
-IMG=$(fly image show -a open-wearables-api --json | jq -r '.Ref')
-fly apps create open-wearables-flower
+cd backend
+fly deploy --config fly.toml \
+  --app open-wearables-api \
+  --env SVIX_SERVER_URL=http://open-wearables-svix.flycast:8071
+cd ..
+```
+
+## 5. Backend App
+
+Deploy the API, worker, and beat process groups:
+
+```bash
+bun run deploy api
+```
+
+The helper sets non-secret runtime values during deploy:
+
+- `API_BASE_URL`
+- `REDIS_HOST`
+- `SVIX_SERVER_URL`
+- `CORS_ORIGINS`
+
+For a custom domain, set `FLY_API_URL` before deploying:
+
+```bash
+export FLY_API_URL=https://api.example.com
+bun run deploy api
+```
+
+## 6. Flower
+
+Flower reuses the latest backend image. It needs the same database and auth
+secrets as the backend because it imports the app settings:
+
+```bash
 fly secrets set -a open-wearables-flower \
-  DB_HOST=<mpg-host> DB_USER=<mpg-user> DB_PASSWORD=<mpg-password> \
-  REDIS_HOST=fly-open-wearables-redis.upstash.io REDIS_USERNAME=default REDIS_PASSWORD=<redis-password> \
-  SECRET_KEY=<same-as-backend> \
+  DB_HOST=<postgres-host> DB_PORT=5432 DB_NAME=open-wearables \
+  DB_USER=<postgres-user> DB_PASSWORD=<postgres-password> \
+  SECRET_KEY=<same-as-backend>
+bun run deploy flower
+```
+
+If `FLOWER_BASIC_AUTH` is missing, `deploy.ts` generates one as `admin:<password>`
+and prints it once. Set your own value if you need deterministic credentials:
+
+```bash
+fly secrets set -a open-wearables-flower \
   FLOWER_BASIC_AUTH="admin:$(openssl rand -hex 16)"
-fly deploy --config deploy/fly/flower.toml --image "$IMG"
 ```
 
-Flower is at `https://open-wearables-flower.fly.dev` behind the basic-auth
-credentials you set. (`flower.sh` waits for a worker `ping` over the Redis broker,
-so the backend app must be up first.)
+## 7. Frontend
 
----
-
-## 6. Frontend
-
-`VITE_API_URL` is baked in at build time, so pass it as a build arg:
+Deploy the frontend:
 
 ```bash
-cd frontend
-fly launch --no-deploy --copy-config --name open-wearables-frontend
-fly deploy --build-arg VITE_API_URL=https://open-wearables-api.fly.dev
+bun run deploy frontend
 ```
 
-Frontend is at `https://open-wearables-frontend.fly.dev`. Finally, add it to the
-backend CORS allow-list:
+The frontend reads `VITE_API_URL` at runtime in the Nitro server, so you do not
+need to rebuild the image to point it at a different API. For a custom API:
 
 ```bash
-fly secrets set -a open-wearables-api CORS_ORIGINS='["https://open-wearables-frontend.fly.dev"]'
+export FLY_API_URL=https://api.example.com
+bun run deploy frontend
 ```
 
----
+If you use a custom frontend domain, add it to CORS:
 
-## Notes & gotchas
+```bash
+export FLY_FRONTEND_URL=https://app.example.com
+bun run deploy api
+```
 
-- **Migrations** run on every web boot via `app.sh`. Fine for one web machine;
-  if you scale web > 1, split migrations into a `release_command` (see comment in
-  `backend/fly.toml`).
-- **Volumes**: nothing persistent lives in the app containers — Postgres/Redis
-  are managed, so no Fly volumes are needed unless you start writing FIT files to
-  local disk (you're using S3 per PR #1099, so keep it remote).
-- **Region**: keep Postgres, Redis, and all apps in the **same region** to avoid
-  cross-region latency on every DB/broker call.
-- **Costs**: with `auto_stop_machines`, idle worker/beat still need to stay up to
-  process the queue — they have no HTTP traffic to wake them, so keep
-  `min_machines_running >= 1` for those (the backend `[[vm]]` covers web/worker/beat
-  on one machine each).
+## 8. Deploy Everything
+
+After Postgres and required secrets are ready:
+
+```bash
+bun run deploy all
+```
+
+The helper deploys components in dependency order:
+
+1. Redis
+2. API
+3. Flower
+4. Frontend
+5. Svix
+
+If you prefer Svix before API, deploy it separately after setting its secrets:
+
+```bash
+bun run deploy redis svix api flower frontend
+```
+
+## Notes
+
+- Keep Postgres, Redis, API, Flower, Svix, and frontend in the same region.
+- `auto_stop_machines` is disabled because worker, beat, webhooks, and Flower
+  should not depend on inbound HTTP traffic to wake up.
+- `scripts/start/app.sh` runs migrations and seed tasks on every web boot. This
+  is acceptable for one web machine. If you scale the `web` process above one
+  machine, move migrations into a Fly release command to avoid concurrent
+  migration attempts.
+- The default Redis app is intentionally private. Do not add public services or
+  public IPs to `deploy/fly/redis.toml`.

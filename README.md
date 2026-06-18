@@ -18,11 +18,11 @@
 
 ## Production Deployment
 
-JustGains runs Open Wearables at:
+Open Wearables can be self-hosted with Docker images, Railway, or Fly.io:
 
-- **Developer portal**: https://app.wearables.justgains.com
-- **API**: https://api.wearables.justgains.com
-- **Celery Flower**: https://flower.wearables.justgains.com
+- **Docker images**: [docs/deployment/docker-images.mdx](docs/deployment/docker-images.mdx)
+- **Railway**: [docs/deployment/railway.mdx](docs/deployment/railway.mdx)
+- **Fly.io**: [DEPLOY-FLY.md](DEPLOY-FLY.md)
 
 ---
 

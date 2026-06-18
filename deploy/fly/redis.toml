@@ -5,7 +5,7 @@
 # no TLS, no auth — matches the app's redis_url builder which emits redis://).
 #
 # First time:
-#   fly apps create open-wearables-redis --org just-super-human
+#   fly apps create open-wearables-redis
 #   fly deploy --config deploy/fly/redis.toml --image redis:8-alpine
 app = "open-wearables-redis"
 primary_region = "iad"
