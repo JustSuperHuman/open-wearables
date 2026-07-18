@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
+from sqlalchemy.orm import Query
 
 from app.database import DbSession
 from app.models import (
@@ -53,6 +54,7 @@ from app.schemas.utils import (
 )
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import on_menstrual_cycle_created, on_sleep_created, on_workout_created
+from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
@@ -70,6 +72,7 @@ class EventRecordService(
         self.data_source_repo = DataSourceRepository()
         self.data_point_series_repo = DataPointSeriesRepository(DataPointSeries)
         self.health_score_repo = HealthScoreRepository(HealthScore)
+        self.priority_service = priority_service
 
     def _resolve_avg_hr(
         self,
@@ -125,6 +128,10 @@ class EventRecordService(
         detail_type: str = "workout",
     ) -> EventRecordDetail:
         result = self.event_record_detail_repo.create(db_session, detail, detail_type=detail_type)
+        # event_record_detail_repo.create commits internally, so data is already persisted.
+        # Fire the webhook directly with fresh fetches rather than via after_commit — using
+        # after_commit defers the call to the *next* session commit, at which point SQLAlchemy
+        # has expired the captured ORM objects, causing lazy-load failures inside after_commit.
         record = db_session.get(EventRecord, detail.record_id)
         if record is not None and record.data_source_id is not None:
             data_source = db_session.get(DataSource, record.data_source_id)
@@ -635,6 +642,14 @@ class EventRecordService(
         if not dispatches:
             return
 
+        # Detach so expire_on_commit doesn't expire these; reading expired attributes
+        # inside after_commit (committed session) would raise. Only loaded scalars are
+        # read, and these objects are local (callers get only IDs), so detaching is safe.
+        for record in records:
+            db_session.expunge(record)
+        for data_source in data_sources:
+            db_session.expunge(data_source)
+
         @sa_event.listens_for(db_session, "after_commit", once=True)
         def _dispatch_bulk_webhooks(session: DbSession) -> None:  # noqa: ARG001
             for record, data_source, detail in dispatches:
@@ -646,10 +661,13 @@ class EventRecordService(
         db_session: DbSession,
         query_params: EventRecordQueryParams,
         user_id: str,
+        restrict_to_record_ids: Query | None = None,
     ) -> tuple[list[tuple[EventRecord, DataSource]], int]:
         self.logger.debug(f"Fetching event records with filters: {query_params.model_dump()}")
 
-        records, total_count = self.crud.get_records_with_filters(db_session, query_params, user_id)
+        records, total_count = self.crud.get_records_with_filters(
+            db_session, query_params, user_id, restrict_to_record_ids=restrict_to_record_ids
+        )
 
         self.logger.debug(f"Retrieved {len(records)} event records out of {total_count} total")
 
@@ -747,7 +765,7 @@ class EventRecordService(
                 if details and details.total_elevation_gain
                 else None,
                 route_polyline=details.route_polyline if details else None,
-                elevation_profile=details.elevation_profile if details else None,  # ty:ignore[invalid-argument-type]
+                elevation_profile=details.elevation_profile if details else None,
             )
             data.append(workout)
 
@@ -809,12 +827,12 @@ class EventRecordService(
             distance_meters=float(details.distance) if details and details.distance else None,
             avg_heart_rate_bpm=self._resolve_avg_hr(db_session, [record]).get(record.id),
             max_heart_rate_bpm=details.heart_rate_max if details else None,
-            avg_pace_sec_per_km=avg_pace_sec_per_km,  # ty:ignore[invalid-argument-type]
+            avg_pace_sec_per_km=avg_pace_sec_per_km,
             elevation_gain_meters=float(details.total_elevation_gain)
             if details and details.total_elevation_gain
             else None,
             route_polyline=details.route_polyline if details else None,
-            elevation_profile=details.elevation_profile if details else None,  # ty:ignore[invalid-argument-type]
+            elevation_profile=details.elevation_profile if details else None,
             heart_rate_samples=[],  # TODO: Fetch from DataPointSeries if needed
         )
 
@@ -824,9 +842,23 @@ class EventRecordService(
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
+        filter_by_priority: bool = False,
     ) -> PaginatedResponse[SleepSession]:
         params.category = "sleep"
-        records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
+
+        # inline query that restricts records to ones
+        # with highest priority
+        restrict_to_record_ids: Query | None = None
+        if filter_by_priority:
+            provider_order = self.priority_service.priority_repo.get_priority_order(db_session)
+            device_type_order = self.priority_service.device_type_priority_repo.get_priority_order(db_session)
+            restrict_to_record_ids = self.crud.winning_sleep_record_ids(
+                db_session, str(user_id), params, provider_order, device_type_order
+            )
+
+        records, total_count = self._get_records_with_filters(
+            db_session, params, str(user_id), restrict_to_record_ids=restrict_to_record_ids
+        )
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
 
@@ -885,7 +917,7 @@ class EventRecordService(
                 if details and details.sleep_efficiency_score
                 else None,
                 is_nap=details.is_nap if (details and details.is_nap is not None) else False,
-                sleep_stage_intervals=details.sleep_stages if details else None,  # ty:ignore[invalid-argument-type]
+                sleep_stage_intervals=details.sleep_stages if details else None,
                 stages=SleepStagesSummary(
                     deep_minutes=details.sleep_deep_minutes or 0 if details else 0,
                     light_minutes=details.sleep_light_minutes or 0 if details else 0,

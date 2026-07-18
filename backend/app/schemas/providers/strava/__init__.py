@@ -3,6 +3,7 @@ from .activity_import import (
     StravaStreamJSON,
     StravaStreamSetJSON,
 )
+from .streams import StravaStream, StravaStreamSet
 from .webhook import StravaWebhookEvent
 
 __all__ = [
@@ -10,6 +11,9 @@ __all__ = [
     "ActivityJSON",
     "StravaStreamJSON",
     "StravaStreamSetJSON",
+    # Streams
+    "StravaStream",
+    "StravaStreamSet",
     # Webhook
     "StravaWebhookEvent",
 ]
