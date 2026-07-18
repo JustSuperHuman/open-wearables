@@ -27,6 +27,7 @@ class EventRecordMetrics(TypedDict, total=False):
     elev_high: Decimal | None
     elev_low: Decimal | None
     route_polyline: str | None
+    elevation_profile: list[dict] | None
     sleep_total_duration_minutes: int | None
     sleep_time_in_bed_minutes: int | None
     sleep_efficiency_score: Decimal | None

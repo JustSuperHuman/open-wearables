@@ -43,6 +43,7 @@ import {
 import type { EventRecordResponse } from '@/lib/api/types';
 import { EventDeleteDialog } from '@/components/common/event-delete-dialog';
 import { WorkoutRouteMap } from '@/components/user/workout-route-map';
+import { WorkoutElevationChart } from '@/components/user/workout-elevation-chart';
 
 interface WorkoutSectionProps {
   userId: string;
@@ -185,6 +186,20 @@ function WorkoutRow({
               <WorkoutRouteMap polyline={workout.route_polyline} />
             </div>
           )}
+
+          {/* Elevation Profile */}
+          {workout.elevation_profile &&
+            workout.elevation_profile.length > 1 && (
+              <div>
+                <h4 className="text-xs font-medium text-muted-foreground mb-3 uppercase tracking-wider">
+                  Elevation
+                </h4>
+                <WorkoutElevationChart
+                  profile={workout.elevation_profile}
+                  gainMeters={workout.elevation_gain_meters}
+                />
+              </div>
+            )}
 
           {/* Heart Rate During Workout Chart */}
           <div>

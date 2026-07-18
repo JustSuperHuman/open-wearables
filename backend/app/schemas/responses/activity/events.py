@@ -11,6 +11,14 @@ from .data_point_responses import TimeSeriesSample
 from .summaries import SleepStagesSummary
 
 
+class ElevationSample(BaseModel):
+    """A single point on a workout's elevation-over-distance profile."""
+
+    distance_m: float | None = Field(None, description="Cumulative distance from the start, in meters")
+    altitude_m: float = Field(..., description="Altitude at this point, in meters")
+    time_s: int | None = Field(None, description="Elapsed time from the start, in seconds")
+
+
 class Workout(BaseModel):
     id: UUID
     type: str  # Should be WorkoutType enum ideally
@@ -31,6 +39,10 @@ class Workout(BaseModel):
     elevation_gain_meters: float | None = None
     route_polyline: str | None = Field(
         None, description="GPS route encoded with the Google Encoded Polyline Algorithm (precision 5)"
+    )
+    elevation_profile: list[ElevationSample] | None = Field(
+        None,
+        description="Ordered elevation-over-distance samples for rebuilding an elevation line chart",
     )
 
 

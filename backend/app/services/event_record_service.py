@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from logging import Logger, getLogger
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
@@ -135,6 +136,25 @@ class EventRecordService(
                 self._emit_event_record_webhook(record, data_source, detail)
 
         return result  # ty:ignore[invalid-return-type]
+
+    def backfill_workout_detail_fields(
+        self,
+        db_session: DbSession,
+        record_id: UUID,
+        fields: dict[str, Any],
+    ) -> None:
+        """Patch columns on an already-persisted workout_details row.
+
+        create_detail is a no-op when the detail already exists (handle_duplicates
+        returns the existing row without updating), so re-syncing never refreshes
+        its columns. Providers use this to backfill GPS-derived fields
+        (route_polyline, elevation_profile) onto previously-synced workouts.
+        Only non-empty values should be passed so existing data is never nulled.
+        """
+        if not fields:
+            return
+        self.event_record_detail_repo.update_workout_fields(db_session, record_id, fields)
+        db_session.commit()
 
     @staticmethod
     def _local_sleep_date(start_datetime: datetime, zone_offset: str | None) -> date:
@@ -727,6 +747,7 @@ class EventRecordService(
                 if details and details.total_elevation_gain
                 else None,
                 route_polyline=details.route_polyline if details else None,
+                elevation_profile=details.elevation_profile if details else None,  # ty:ignore[invalid-argument-type]
             )
             data.append(workout)
 
@@ -793,6 +814,7 @@ class EventRecordService(
             if details and details.total_elevation_gain
             else None,
             route_polyline=details.route_polyline if details else None,
+            elevation_profile=details.elevation_profile if details else None,  # ty:ignore[invalid-argument-type]
             heart_rate_samples=[],  # TODO: Fetch from DataPointSeries if needed
         )
 

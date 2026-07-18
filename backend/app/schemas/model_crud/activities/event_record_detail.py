@@ -34,6 +34,10 @@ class EventRecordDetailBase(BaseModel):
     # Encoded GPS route (Google Encoded Polyline Algorithm, precision 5)
     route_polyline: str | None = None
 
+    # Elevation-over-distance profile: ordered list of
+    # {"distance_m", "altitude_m", "time_s"} samples for rebuilding a line chart.
+    elevation_profile: list[dict] | None = None
+
     # Sleep-specific fields
     sleep_total_duration_minutes: int | None = None
     sleep_time_in_bed_minutes: int | None = None

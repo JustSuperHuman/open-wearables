@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JustGains × Open-Wearables — Workout Sync Architecture Review</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #131722;
+    --panel2: #1a2030;
+    --border: #2a3245;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --indigo: #818cf8;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --cyan: #22d3ee;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 0 80px;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.6 "Segoe UI", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 0 28px; }
+  header {
+    padding: 48px 0 28px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #11162280, transparent);
+  }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -.5px; }
+  h1 .x { color: var(--indigo); }
+  .sub { color: var(--muted); font-size: 15px; }
+  h2 { font-size: 21px; margin: 48px 0 14px; padding-top: 8px; letter-spacing: -.3px; }
+  h2 .n { color: var(--indigo); font-weight: 700; margin-right: 8px; }
+  h3 { font-size: 16px; margin: 24px 0 8px; color: var(--cyan); }
+  p { color: #c5cad6; }
+  code {
+    background: var(--panel2); border: 1px solid var(--border);
+    padding: 1px 6px; border-radius: 5px; font-size: 13px; color: var(--cyan);
+    font-family: Consolas, "Cascadia Code", monospace;
+  }
+  .badge {
+    display: inline-block; font-size: 11.5px; font-weight: 700; letter-spacing: .4px;
+    padding: 2px 9px; border-radius: 999px; vertical-align: middle; text-transform: uppercase;
+  }
+  .ok    { background: #052e1f; color: var(--green); border: 1px solid #14532d; }
+  .warn  { background: #2e2305; color: var(--amber); border: 1px solid #713f12; }
+  .gap   { background: #2e0a0a; color: var(--red);   border: 1px solid #7f1d1d; }
+  .info  { background: #082636; color: var(--cyan);  border: 1px solid #155e75; }
+
+  /* ── Flow diagram ── */
+  .diagram { margin: 26px 0; }
+  .lane {
+    display: grid; grid-template-columns: 150px 1fr; gap: 0 18px;
+    align-items: stretch; margin-bottom: 0;
+  }
+  .lane-label {
+    color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 1px; display: flex; align-items: center; justify-content: flex-end;
+    text-align: right; padding-right: 4px;
+  }
+  .lane-row { display: flex; gap: 14px; flex-wrap: wrap; padding: 10px 0; }
+  .node {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 16px; min-width: 170px; flex: 1;
+    box-shadow: 0 2px 12px #0006;
+  }
+  .node.hero { border-color: var(--indigo); box-shadow: 0 0 0 1px var(--indigo), 0 4px 24px #818cf822; }
+  .node .t { font-weight: 700; font-size: 14.5px; }
+  .node .d { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+  .arrows {
+    display: grid; grid-template-columns: 150px 1fr; gap: 0 18px;
+  }
+  .arrow-row { display: flex; gap: 14px; justify-content: space-around; padding: 2px 0; }
+  .arrow {
+    color: var(--muted); font-size: 12px; text-align: center; flex: 1;
+  }
+  .arrow .line { color: var(--indigo); font-size: 16px; line-height: 1; }
+  .arrow.devicepath .line { color: var(--green); }
+  .legend { display: flex; gap: 22px; margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .legend .sw { display: inline-block; width: 22px; text-align: center; font-weight: 700; }
+
+  table {
+    border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px;
+    background: var(--panel); border-radius: 10px; overflow: hidden;
+  }
+  th, td { text-align: left; padding: 9px 13px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--panel2); color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+  tr:last-child td { border-bottom: none; }
+  td .badge { margin-right: 2px; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 20px; margin: 10px 0;
+  }
+  .card h3 { margin-top: 2px; }
+  .step {
+    display: grid; grid-template-columns: 44px 1fr auto; gap: 16px; align-items: start;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 20px; margin: 10px 0;
+  }
+  .step .num {
+    width: 36px; height: 36px; border-radius: 10px; background: var(--panel2);
+    border: 1px solid var(--indigo); color: var(--indigo); font-weight: 800; font-size: 16px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step .t { font-weight: 700; font-size: 15px; }
+  .step .d { color: #b8bfce; font-size: 13.5px; margin-top: 4px; }
+  .step .effort { color: var(--muted); font-size: 12px; white-space: nowrap; padding-top: 8px; }
+  ul { color: #c5cad6; }
+  li { margin: 4px 0; }
+  .small { font-size: 12.5px; color: var(--muted); }
+  footer { margin-top: 60px; color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--border); padding-top: 18px; }
+</style>
+</head>
+<body>
+
+<header><div class="wrap">
+  <h1>JustGains <span class="x">×</span> Open-Wearables</h1>
+  <div class="sub">End-to-end workout sync review — HealthKit · Health Connect · JustGains-API · open-wearables — June 10, 2026 · <strong style="color:var(--green)">UPDATED June 11: all plan steps implemented, deployed &amp; verified E2E</strong></div>
+</div></header>
+
+<div class="wrap">
+
+<h2><span class="n">1</span>How data flows today</h2>
+<p>There are <strong>two independent pipelines</strong> into JustGains. The <span style="color:var(--green)">device path</span> reads whatever landed on the phone's health store; the <span style="color:var(--indigo)">cloud path</span> pulls provider accounts (currently Strava) through our self-hosted open-wearables instance. Both converge on the same <code>FitnessActivities</code> table and render identically in the feed.</p>
+
+<div class="diagram">
+  <div class="lane">
+    <div class="lane-label">Sources</div>
+    <div class="lane-row">
+      <div class="node"><div class="t">🏃 Strava</div><div class="d">OAuth · activities + GPS polyline + name</div></div>
+      <div class="node"><div class="t">⌚ Watch / phone sensors</div><div class="d">Apple Watch, WearOS, manual entries</div></div>
+      <div class="node"><div class="t">🔮 Future: Garmin · Polar · Oura · Whoop · Suunto · Fitbit</div><div class="d">already supported by OW, not yet exposed in JG</div></div>
+    </div>
+  </div>
+  <div class="arrows"><div></div><div class="arrow-row">
+    <div class="arrow"><div class="line">▼</div>OAuth + hourly poll / webhook</div>
+    <div class="arrow devicepath"><div class="line">▼</div>OS writes automatically</div>
+    <div class="arrow"><div class="line">▼</div>OAuth (same generic flow)</div>
+  </div></div>
+
+  <div class="lane">
+    <div class="lane-label">Aggregators</div>
+    <div class="lane-row">
+      <div class="node hero"><div class="t">☁️ open-wearables <span class="badge ok">Live</span></div><div class="d">wearables.api.justgains.com · normalizes 11 providers → <code>event_record</code> + <code>workout_details.route_polyline</code> · hourly Celery sync · <strong>Strava webhook ON</strong> · <strong>Svix server deployed</strong> (open-wearables-svix, internal) emitting <code>workout.created</code></div></div>
+      <div class="node"><div class="t">📱 Apple Health / Health Connect</div><div class="d">on-device stores; Strava can also mirror into these (double-entry risk)</div></div>
+    </div>
+  </div>
+  <div class="arrows"><div></div><div class="arrow-row">
+    <div class="arrow"><div class="line">▼</div><code>workout.created</code> webhook (Svix) + hourly background sync + foreground trigger — incremental <code>GET /events/workouts</code></div>
+    <div class="arrow devicepath"><div class="line">▼</div>mobile reads on foreground (5-min throttle) + 365-day backfill</div>
+  </div></div>
+
+  <div class="lane">
+    <div class="lane-label">Our API</div>
+    <div class="lane-row">
+      <div class="node hero"><div class="t">🟣 JustGains-API <span class="badge ok">Live (testing + local)</span></div><div class="d"><code>FitnessActivities</code> · unique <code>(CreatorProfileId, Source, ExternalId)</code> upsert · <code>UserWearablesController</code> proxy (OW key never ships to mobile) · OW type → <code>FitnessActivityType</code> mapping · Svix webhook receiver · hourly background sync · cross-source dedup</div></div>
+    </div>
+  </div>
+  <div class="arrows"><div></div><div class="arrow-row">
+    <div class="arrow"><div class="line">▼</div>feed API + fitness-activities endpoints (with <code>routePolyline</code>)</div>
+  </div></div>
+
+  <div class="lane">
+    <div class="lane-label">Clients</div>
+    <div class="lane-row">
+      <div class="node"><div class="t">📲 JustGains-Mobile</div><div class="d">feed cards + SVG <code>RouteMap</code> · ConnectedApps (provider list from API) · RouteActivitiesDebug ("Sync Open Wearables now") · wearables sync fired on app foreground</div></div>
+      <div class="node"><div class="t">🖥️ OW Dashboard</div><div class="d">workout names + SVG route rendering (deployed today)</div></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><span class="sw" style="color:var(--indigo)">▼</span> cloud path (Strava → OW → JG)</span>
+    <span><span class="sw" style="color:var(--green)">▼</span> device path (HealthKit / Health Connect → JG)</span>
+  </div>
+</div>
+
+<h2><span class="n">2</span>Sync triggers &amp; freshness — as of June 11 (all verified live)</h2>
+<table>
+  <tr><th>Hop</th><th>Mechanism</th><th>Latency</th><th>Status</th></tr>
+  <tr>
+    <td>Strava → open-wearables</td>
+    <td><strong>Strava webhook enabled</strong> (<code>live_sync_mode=webhook</code>, subscription 353452, challenge verified) — new activities push instantly. Hourly Celery poll + 365-day historical-on-connect remain as the baseline (worker + beat machines confirmed running).</td>
+    <td><strong>Seconds</strong></td>
+    <td><span class="badge ok">Verified</span></td>
+  </tr>
+  <tr>
+    <td>open-wearables → JustGains-API</td>
+    <td><strong>Three layers:</strong> ① Svix <code>workout.created</code> webhook → <code>POST /api/webhooks/open-wearables</code> (HMAC-verified) triggers an immediate per-user sync; ② <code>WearablesBackgroundSyncService</code> re-syncs every connected user hourly; ③ mobile fires <code>POST /user/wearables/sync-activities</code> on app foreground. Pull windows are incremental (last sync − 7 d; full history only on first sync).</td>
+    <td><strong>Seconds</strong> (webhook), ≤ 1 h worst case</td>
+    <td><span class="badge ok">Verified E2E</span></td>
+  </tr>
+  <tr>
+    <td>HealthKit / Health Connect → JustGains-API</td>
+    <td>App-foreground sync (5-min throttle) via <code>useHealthSync</code>; resumable 365-day background backfill; routes read from <code>HKWorkoutRoute</code> / <code>ExerciseRoute</code>, encoded to polyline, bulk <code>POST …/fitness-activities/import</code></td>
+    <td>Next app open</td>
+    <td><span class="badge ok">Working</span></td>
+  </tr>
+  <tr>
+    <td>JustGains workouts → device health store</td>
+    <td><code>healthWrite.ts</code> writes strength sessions (+ calories) back to HealthKit/Health Connect on completion — best-effort</td>
+    <td>Immediate</td>
+    <td><span class="badge ok">Working</span></td>
+  </tr>
+  <tr>
+    <td>JustGains workouts → open-wearables</td>
+    <td>Not implemented — OW never sees natively-logged JG strength workouts (future: OW SDK sync endpoint)</td>
+    <td>—</td>
+    <td><span class="badge info">Future</span></td>
+  </tr>
+</table>
+
+<h2><span class="n">3</span>What's solid</h2>
+<div class="grid2">
+  <div class="card"><h3>Idempotent everywhere</h3><p class="small">Every layer dedups: OW has unique <code>(data_source, start, end)</code> + insert-or-return; JG has unique <code>(creator, source, externalId)</code> with batch upsert; mobile imports carry stable <code>healthkit:UUID</code> / <code>strava:{id}</code> external IDs. Re-syncs update in place — verified live.</p></div>
+  <div class="card"><h3>Routes are first-class, end to end</h3><p class="small">One format (Google Encoded Polyline, precision 5) from all three sources. Renders in the mobile feed <code>RouteMap</code>, the debug screen, and now the OW dashboard — all dependency-free SVG. Verified with real Strava GPS data.</p></div>
+  <div class="card"><h3>Security model is right</h3><p class="small">OW API key lives only server-side; mobile talks to JG which proxies. OAuth callback creates the connection server-side <em>before</em> redirecting, so browser dismissal can't lose a connection. Per-user OW mapping is server-managed JSONB.</p></div>
+  <div class="card"><h3>Future providers are credentials-only</h3><p class="small">OW already normalizes Garmin, Polar, Oura, Whoop, Suunto, Fitbit + Apple/Samsung/Google SDK push + FIT files. JG now maps all of them (<code>ActivitySource</code> + sync service), and ConnectedApps loads its provider list from <code>GET /user/wearables/providers</code>. Adding a provider = configuring its OAuth credentials on the OW platform. Nothing else.</p></div>
+</div>
+
+<h2><span class="n">4</span>Gaps found — resolution status (June 11)</h2>
+<table>
+  <tr><th>#</th><th>Gap</th><th>Resolution</th><th>Status</th></tr>
+  <tr><td>G1</td><td><strong>No automatic OW→JG sync.</strong></td><td>Svix webhook receiver + hourly background service + app-foreground trigger. Verified: a re-synced Strava activity produced <code>workout.created</code> → JG responded <code>{"status":"synced","imported":1}</code> on both local and testing environments within seconds.</td><td><span class="badge ok">Closed</span></td></tr>
+  <tr><td>G2</td><td><strong>Cross-source duplicates</strong> (Strava + its Apple Health mirror).</td><td><code>FitnessActivityDuplicateDetector</code>: same type, start within ±2 min, duration within ±10% (60 s floor) across different sources → richer record stays visible, other gets <code>ShowInFeed=false</code>. Priority: wearable platform &gt; health store &gt; manual. Runs on every import/upsert; 10 unit tests pass.</td><td><span class="badge ok">Closed</span></td></tr>
+  <tr><td>G3</td><td><strong>Full-history pull every sync.</strong></td><td>Per-provider <code>WearablesLastSyncedAt</code> stamp (UserPrivateMeta JSONB); pulls last-sync − 7 days; full history only on a provider's first sync. Stamp written only after successful import so failures retry the same window.</td><td><span class="badge ok">Closed</span></td></tr>
+  <tr><td>G4</td><td><strong>Strava webhook + Celery worker unverified.</strong></td><td>Worker + beat machines confirmed processing tasks; Strava subscription 353452 registered &amp; challenge-verified. Bonus fix: OW's <code>create_detail</code> registered its webhook emitter <em>after</em> the commit, silently dropping <code>workout.created</code> for the last record of every sync — now emits directly (commit <code>8758b31</code>).</td><td><span class="badge ok">Closed</span></td></tr>
+  <tr><td>G5</td><td><strong>No background health-store observers.</strong></td><td>Deferred — device path still syncs on app-foreground (acceptable: data is fresh whenever the user looks).</td><td><span class="badge info">Future</span></td></tr>
+  <tr><td>G6</td><td><strong>Single provider exposed.</strong></td><td><code>ActivitySource</code> += GARMIN/POLAR/OURA/WHOOP/SUUNTO/FITBIT; sync service maps all of them; ConnectedApps list now driven by <code>GET /user/wearables/providers</code> (verified returning 7 providers). A new provider now only needs OAuth credentials on the OW platform.</td><td><span class="badge ok">Closed</span></td></tr>
+  <tr><td>G7</td><td><strong>Deploy drift.</strong></td><td>PR #1 merged to fork main; OW api + frontend redeployed from main; JG-API deployed to testing (new endpoints verified live); all changes committed &amp; pushed in both repos.</td><td><span class="badge ok">Closed</span></td></tr>
+</table>
+
+<h2><span class="n">5</span>Plan — executed June 11, 2026 (steps 1–6 complete; step 7 future)</h2>
+
+<div class="step"><div class="num">1</div><div>
+  <div class="t">Verify OW background machinery on Fly, enable Strava webhook</div>
+  <div class="d">Confirm the Celery worker + beat processes run on <code>open-wearables-api</code> (check <code>fly.toml</code> processes / <code>fly status</code>). Set Strava <code>live_sync_mode=webhook</code> via <code>PUT /api/v1/oauth/providers/strava</code> so OW auto-registers its webhook → new Strava activities land in OW within seconds instead of ≤1 h. Closes G4.</div>
+</div><div class="effort"><span class="badge ok">✅ Done</span></div></div>
+
+<div class="step"><div class="num">2</div><div>
+  <div class="t">Automate OW → JustGains sync (closes G1 — the big one)</div>
+  <div class="d">Two layers, do both: <strong>(a)</strong> a JG <code>IHostedService</code> that re-syncs every connected user on an interval (hourly; cheap once step 3 lands) as the reliable baseline; <strong>(b)</strong> a Svix webhook receiver in JG (<code>POST /api/webhooks/open-wearables</code>, signature-verified) subscribed to OW's <code>workout.created</code> events, which triggers an immediate per-user sync for instant feel. Mobile also gains a passive trigger: fire-and-forget <code>sync-activities</code> on app foreground alongside the existing health sync.</div>
+</div><div class="effort"><span class="badge ok">✅ Done</span></div></div>
+
+<div class="step"><div class="num">3</div><div>
+  <div class="t">Incremental sync windows (closes G3)</div>
+  <div class="d">Store <code>LastWearablesSyncAt</code> per user (UserPrivateMeta, no migration). Pull <code>start_date = lastSync − 7 days</code> (buffer for late edits/uploads) instead of 2000-01-01; keep the full-history pull only for first connect. Upserts make the overlap harmless.</div>
+</div><div class="effort"><span class="badge ok">✅ Done</span></div></div>
+
+<div class="step"><div class="num">4</div><div>
+  <div class="t">Cross-source dedup (closes G2)</div>
+  <div class="d">At import time, before inserting an activity, look for an existing activity of the same type within ±2 min start time and ~±10% duration from a <em>different</em> source. Keep the richer record (prefer the one with routePolyline / HR), mark the other <code>ShowInFeed=false</code> with a pointer. Source-priority order: STRAVA/wearable &gt; HEALTHKIT/HEALTH_CONNECT &gt; MANUAL. Add tests with the real double-entry case (Strava + Strava-mirrored-to-Apple-Health).</div>
+</div><div class="effort"><span class="badge ok">✅ Done</span></div></div>
+
+<div class="step"><div class="num">5</div><div>
+  <div class="t">Ship it: deploys + commits</div>
+  <div class="d">Merge open-wearables PR #1 on the fork and redeploy <code>open-wearables-api</code>/<code>frontend</code> from it (deployed app currently lags the fork's newer upstream commits). Commit JustGains-API + Mobile changes, regenerate SDK (<code>routePolyline</code> into the official OpenAPI spec), deploy JG-API to testing (<code>node scripts/deploy-api.js</code>).</div>
+</div><div class="effort"><span class="badge ok">✅ Done</span></div></div>
+
+<div class="step"><div class="num">6</div><div>
+  <div class="t">Second provider as the generalization proof (closes G6)</div>
+  <div class="d">Pick Garmin (richest data; OW handles its webhook backfill natively). Add OAuth creds to OW, append <code>GARMIN</code> to <code>ActivitySource</code> (int enum — append only!), drive ConnectedApps provider list from a JG endpoint instead of the hardcoded array. Everything else (connect, sync, types, routes) already generalizes. <em>*All code shipped (enum + mapper + dynamic <code>GET /user/wearables/providers</code> + mobile list); the only remaining piece per provider is OAuth credentials on the OW platform.</em></div>
+</div><div class="effort"><span class="badge ok">✅ Done*</span></div></div>
+
+<div class="step"><div class="num">7</div><div>
+  <div class="t">Later: device-path freshness + JG→OW push</div>
+  <div class="d"><strong>(a)</strong> <code>HKObserverQuery</code> + Health Connect background reads for instant device-path sync (G5). <strong>(b)</strong> Push native JustGains strength workouts into OW via its SDK sync endpoint (<code>POST /api/v1/sdk/users/{id}/sync</code>) so OW becomes the single longitudinal store — enables OW-side health scores over JG workouts. <strong>(c)</strong> Surface OW's extra riches in-app: sleep, HRV, recovery scores are already normalized and one API call away.</div>
+</div><div class="effort">future</div></div>
+
+<h2><span class="n">6</span>Verification snapshot (what was actually tested live)</h2>
+<h3>June 10 — original integration</h3>
+<ul>
+  <li>✅ Strava OAuth from the Android emulator → OW connection created → deep-link return to ConnectedApps</li>
+  <li>✅ 30 workouts (365-day window) synced with names + GPS polylines into OW (<code>workout_details.route_polyline</code>, migration <code>7e3a9c41f2b8</code>)</li>
+  <li>✅ JG sync imported them as <code>source=STRAVA</code>, dedup key <code>strava:{id}</code>; re-running sync = 0 duplicates</li>
+  <li>✅ Routes render in mobile RouteActivitiesDebug ("From Strava (synced)") and the OW dashboard (149-point route verified)</li>
+</ul>
+<h3>June 11 — automation rollout</h3>
+<ul>
+  <li>✅ <strong>Instant pipeline E2E:</strong> deleted a workout in OW → triggered Strava re-sync → OW emitted <code>workout.created</code> → Svix delivered to the JG receiver → signature verified, user resolved, sync ran → <code>{"status":"synced","imported":1}</code> in seconds, on <strong>both</strong> the local dev API (via Tailscale funnel) and <strong>testing.api.justgains.com</strong></li>
+  <li>✅ Strava→OW webhook subscription registered &amp; challenge-verified (id 353452); Celery worker + beat confirmed processing scheduled tasks</li>
+  <li>✅ Svix server live at <code>open-wearables-svix.flycast:8071</code> (own app, internal-only); all OW event types registered at API startup</li>
+  <li>✅ Upstream OW bug found &amp; fixed: <code>workout.created</code> was silently dropped for the last/only record of a sync (after_commit registered post-commit) — commit <code>8758b31</code>, 222 OW tests pass</li>
+  <li>✅ <code>GET /user/wearables/providers</code> returns 7 providers (Strava/Garmin/Polar/Oura/Whoop/Suunto/Fitbit) with platform icons; <code>POST /user/wearables/sync-activities</code> returned <code>importedCount: 1</code> via the incremental window</li>
+  <li>✅ Cross-source dedup: 10/10 unit tests (Strava+HealthKit mirror case, tolerances, richness/priority/stability winners)</li>
+  <li>✅ JG-API deployed to testing with new endpoints live (401-auth verified); PR #1 merged; OW api + frontend redeployed from fork main; all commits pushed (JG <code>d390dcd1</code>, OW <code>8758b31</code>)</li>
+  <li>✅ All Fly machines set to never auto-stop (api web/worker/beat, frontend, flower, svix, redis)</li>
+  <li>✅ <strong>Disconnect / reconnect cycle:</strong> disconnect returns 204 and flips the connection to <code>revoked</code> (UI shows "Connect" again; background sync skips it) → re-running the connect flow opened the real Strava consent screen → Authorize → callback recreated the connection (<code>active</code>, full scopes) → OW's auto historical-sync fired <code>workout.created</code> <strong>within 1 second</strong> and JustGains imported automatically (<code>{"status":"synced","imported":1}</code>) with zero manual steps</li>
+  <li>✅ RouteActivitiesDebug screen now syncs ALL connected wearables ("Sync Open Wearables now", section "From Open Wearables (Strava, Garmin, …)") instead of Strava-only; typecheck clean</li>
+  <li>⚠️ Not yet live-tested: a brand-new activity recorded in the Strava app itself (the webhook subscription + replayed-activity test make this extremely likely to work — worth a real run/walk as a smoke test); cross-source dedup with a real HealthKit mirror (unit-tested only); non-Strava providers (need OAuth creds on OW)</li>
+</ul>
+<p class="small">Housekeeping notes: the Svix endpoint secrets live in JG appsettings (<code>OpenWearables:WebhookSecret</code> — testing endpoint in appsettings.json, temp local-funnel endpoint in appsettings.Development.json; delete endpoint <code>ep_3Ey9gB59…</code> via the OW API when local-funnel dev ends). The Strava webhook verify token derives from a placeholder — rotate <code>STRAVA_WEBHOOK_VERIFY_TOKEN</code> + re-register the subscription at some point. Dashboard dev account claude-dev@justgains.com still exists (rotate/delete if unwanted).</p>
+
+<h2><span class="n">7</span>Failure modes &amp; graceful degradation <span class="badge ok">Tested live June 11</span></h2>
+<p>The app must lose <strong>zero</strong> quality when the open-wearables platform is down or the device is offline — wearables sync is an enhancement layered onto a working app, never a dependency. Verified by pointing the API at a dead OW address and probing every endpoint.</p>
+<table>
+  <tr><th>Failure</th><th>What happens</th><th>Recovery</th></tr>
+  <tr>
+    <td><strong>OW platform down</strong> — user opens Connected Apps</td>
+    <td>Interactive calls fail fast (8 s cap; ~2 s when refused — measured) with clean 400 envelopes, never 500s or hangs. The provider list is served from the API's last-successful cache; if even that's cold, the app falls back to its built-in list. Connections show "pull to retry".</td>
+    <td>Automatic on next request</td>
+  </tr>
+  <tr>
+    <td><strong>OW down</strong> — app foreground / debug-screen sync</td>
+    <td>Foreground sync is fire-and-forget with a swallow-all catch — completely invisible to the user. The debug screen shows its inline error message. Device health-store sync is independent and continues normally.</td>
+    <td>Next foreground / tap</td>
+  </tr>
+  <tr>
+    <td><strong>OW down</strong> — hourly background pass</td>
+    <td>Per-user failures are logged and skipped; after 3 consecutive failures the pass aborts (circuit breaker) instead of burning a timeout per user.</td>
+    <td>Next hourly pass</td>
+  </tr>
+  <tr>
+    <td><strong>OW down</strong> — webhooks</td>
+    <td>None arrive (OW emits them), so nothing to handle. In-flight deliveries are queued by Svix and retried with backoff.</td>
+    <td>Svix retry / next pass</td>
+  </tr>
+  <tr>
+    <td><strong>JustGains-API down</strong> — webhook delivery</td>
+    <td>Receiver returns non-2xx → Svix retries with exponential backoff; the hourly pass and foreground syncs also re-cover the window (everything is idempotent upserts).</td>
+    <td>Svix retry</td>
+  </tr>
+  <tr>
+    <td><strong>Device offline</strong></td>
+    <td>Health-store reads are local and keep working; daily metrics persist to the local DB and queue for the next <code>/sync</code>. The activity-import cursor only advances when the import actually reached the server (bug found &amp; fixed here — offline workouts previously fell out of the window permanently). Feed renders from SWR cache; wearables sync silently no-ops.</td>
+    <td>Next online sync, no data loss</td>
+  </tr>
+  <tr>
+    <td><strong>Strava down</strong></td>
+    <td>Upstream of OW — sync tasks fail inside OW and log; nothing user-visible in JustGains.</td>
+    <td>OW's next poll / webhook</td>
+  </tr>
+</table>
+<p class="small">Measured with the API pointed at a dead OW URL: providers / connections / sync-all / connect / disconnect all returned structured 400s in ≈2 s; after restoring the URL, everything recovered instantly with the Strava connection intact.</p>
+
+<h2><span class="n">8</span>Future: syncing workouts <em>out</em> to Strava &amp; friends <span class="badge info">Way later — design sketch</span></h2>
+<p>Everything above is <strong>inbound</strong> (provider → JustGains). The reverse — a strength session logged in JustGains showing up on the user's Strava profile — is a different feature with its own constraints. Nothing here is built; this is the plan for when it's wanted.</p>
+
+<h3>What already works today (the lazy path)</h3>
+<p class="small">On workout completion, <code>healthWrite.ts</code> already writes the session into Apple Health / Health Connect. Users who enable Strava's own "import from Apple Health"-style integrations get JG workouts on Strava with <em>zero</em> work from us. Worth documenting for users before building anything.</p>
+
+<h3>How a real push would work</h3>
+<table>
+  <tr><th>Piece</th><th>Detail</th></tr>
+  <tr>
+    <td>Strava API</td>
+    <td><code>POST /api/v3/activities</code> creates a manual activity (name, sport type, start, elapsed time, description, optional distance) — right fit for gym sessions, which have no GPS file. GPS workouts would use <code>POST /api/v3/uploads</code> with a generated TCX/GPX instead.</td>
+  </tr>
+  <tr>
+    <td>OAuth scope</td>
+    <td>Pushing requires <code>activity:write</code>. Current connections are read-only (<code>activity:read_all,profile:read_all</code>), so users must <strong>re-authorize</strong> — gate this behind a "Share workouts to Strava" toggle that triggers a fresh connect flow with the wider scope.</td>
+  </tr>
+  <tr>
+    <td>Where the code lives</td>
+    <td>Provider tokens deliberately live only in open-wearables — JustGains never sees them. So the push belongs in OW as a small generic endpoint (<code>POST /api/v1/users/{id}/providers/{provider}/workouts</code>) that maps a normalized workout onto each provider's create-activity API. JG calls it server-side after workout completion. This is also the most valuable upstream PR of the bunch — OW currently has no outbound push at all.</td>
+  </tr>
+  <tr>
+    <td>Echo prevention</td>
+    <td>A pushed workout comes straight back via the Strava→OW webhook. Two guards: stamp the Strava activity's <code>external_id</code> with a JG marker (e.g. <code>justgains:{workoutLogId}</code>) and skip those on import; the cross-source dedup pass (G2) is the backstop if a marker is ever lost.</td>
+  </tr>
+  <tr>
+    <td>UX</td>
+    <td>Per-provider toggle in Connected Apps ("Share completed workouts to Strava"); fire-and-forget push on workout completion with a retry queue; respect deletes (user deletes the JG workout → delete the pushed Strava activity via its stored id).</td>
+  </tr>
+  <tr>
+    <td>Other providers</td>
+    <td>Garmin/Polar/etc. have far more restrictive (or no) write APIs — Strava is realistically the only push target. Design the OW endpoint generically but ship Strava-only.</td>
+  </tr>
+</table>
+<p class="small">Rough order when picked up: ① OW push endpoint + Strava manual-activity mapper, ② <code>activity:write</code> re-auth flow + toggle, ③ echo-prevention marker on import, ④ push-on-completion + delete propagation. Roughly 2–3 days end to end, dominated by the re-auth UX and echo testing.</p>
+
+<footer class="wrap" style="padding-left:0;padding-right:0">
+  Generated 2026-06-10, updated 2026-06-11 after full plan execution · sources: JustGains-Mobile (<code>src/lib/health/*</code>, <code>useHealthSync</code>), JustGains-API (<code>FitnessActivityService</code>, <code>Services/Wearables/*</code>, <code>OpenWearablesWebhooksController</code>), open-wearables (<code>providers/*</code>, <code>celery/core.py</code>, <code>svix.py</code>) · fork PR #1 merged: github.com/JustSuperHuman/open-wearables
+</footer>
+
+</div>
+</body>
+</html>

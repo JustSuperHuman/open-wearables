@@ -582,6 +582,15 @@ export interface ChatRequest {
   userId?: string;
 }
 
+export interface ElevationSample {
+  // Cumulative distance from the start, in meters (null if no distance stream)
+  distance_m?: number | null;
+  // Altitude at this point, in meters
+  altitude_m: number;
+  // Elapsed time from the start, in seconds
+  time_s?: number | null;
+}
+
 export interface EventRecordResponse {
   id: string;
   type: string;
@@ -603,6 +612,8 @@ export interface EventRecordResponse {
   avg_pace_sec_per_km?: number | null;
   // GPS route encoded with the Google Encoded Polyline Algorithm (precision 5)
   route_polyline?: string | null;
+  // Ordered elevation-over-distance samples for rebuilding an elevation line chart
+  elevation_profile?: ElevationSample[] | null;
   // The workout's id on the source provider (e.g. Strava activity id)
   external_id?: string | null;
 

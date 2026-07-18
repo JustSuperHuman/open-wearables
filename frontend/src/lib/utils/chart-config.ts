@@ -23,3 +23,13 @@ export const WEIGHT_CHART_CONFIG = {
     color: '#3b82f6',
   },
 } satisfies ChartConfig;
+
+/**
+ * Chart configuration for elevation profile visualizations
+ */
+export const ELEVATION_CHART_CONFIG = {
+  altitude: {
+    label: 'Elevation (m)',
+    color: '#34d399',
+  },
+} satisfies ChartConfig;

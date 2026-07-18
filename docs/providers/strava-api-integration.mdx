@@ -37,6 +37,17 @@ Strava provides access to activity/workout data through their API. The integrati
 
 Strava is an activity-focused platform — it does not provide continuous health monitoring data like sleep, HRV, or daily summaries.
 
+### Routes and elevation
+
+For activities recorded with GPS, Open Wearables stores two extra pieces of geospatial data so the UI can visualise the workout:
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `route_polyline` | `map.summary_polyline` / `map.polyline` | The GPS route, encoded with the Google Encoded Polyline Algorithm (precision 5). |
+| `elevation_profile` | Activity **streams** (`altitude`, `distance`, `time`) | An ordered list of `{ distance_m, altitude_m, time_s }` samples for rebuilding an elevation line chart. |
+
+When an activity has GPS or elevation, the sync makes one extra call to the Strava [activity streams endpoint](https://developers.strava.com/docs/reference/#api-Streams-getActivityStreams) (`GET /activities/{id}/streams?keys=distance,altitude,time`). The altitude stream is paired with distance/time and downsampled to a compact profile (the true lowest and highest points are always preserved). Indoor or manual activities with no altitude stream simply have a `null` `elevation_profile`, and a streams failure never blocks the rest of the sync. Both fields are additive and backwards compatible — older workouts keep working and are populated on the next sync.
+
 ### Data delivery
 
 | Method | Description |

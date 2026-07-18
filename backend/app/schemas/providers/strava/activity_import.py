@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StravaGearJSON(BaseModel):
@@ -22,6 +22,34 @@ class StravaMapJSON(BaseModel):
     summary_polyline: str | None = None  # Google Encoded Polyline (precision 5)
     polyline: str | None = None  # Full-resolution polyline (DetailedActivity only)
     resource_state: int | None = None
+
+
+class StravaStreamJSON(BaseModel):
+    """A single Strava activity stream (e.g. altitude, distance, time).
+
+    Strava returns each stream as a parallel array of samples; all streams of an
+    activity share the same length and index alignment.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    data: list[float] = Field(default_factory=list)
+    series_type: str | None = None  # "distance" or "time"
+    original_size: int | None = None
+    resolution: str | None = None  # "low" | "medium" | "high"
+
+
+class StravaStreamSetJSON(BaseModel):
+    """Strava activity streams keyed by type (key_by_type=true response).
+
+    Only the scalar streams we use for the elevation profile are modelled here.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    altitude: StravaStreamJSON | None = None
+    distance: StravaStreamJSON | None = None
+    time: StravaStreamJSON | None = None
 
 
 class ActivityJSON(BaseModel):

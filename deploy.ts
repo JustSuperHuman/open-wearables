@@ -172,7 +172,14 @@ function flyEnvArgs(values: EnvValues): string[] {
 
 async function ensureApp(app: string): Promise<void> {
   const existing = await $`fly apps list`.text().catch(() => "");
-  if (existing.split(/\r?\n/).some((line) => line.split(/\s+/)[0] === app)) {
+  // `fly apps list` renders a box table whose rows start with whitespace and use
+  // `│` column separators, so `split(/\s+/)[0]` is "" and never matches. Match the
+  // app name as any whitespace-delimited token instead.
+  if (
+    existing
+      .split(/\r?\n/)
+      .some((line) => line.split(/\s+/).filter(Boolean).includes(app))
+  ) {
     return;
   }
 

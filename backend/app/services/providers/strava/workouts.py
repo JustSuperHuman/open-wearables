@@ -13,10 +13,67 @@ from app.schemas.model_crud.activities import (
     EventRecordMetrics,
 )
 from app.schemas.providers.strava import ActivityJSON as StravaActivityJSON
+from app.schemas.providers.strava import StravaStreamSetJSON
 from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.utils.dates import offset_to_iso
+from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
+
+# Cap on stored elevation samples per workout. Strava's altitude stream can be
+# 10k+ points; this keeps the profile compact for transport while preserving the
+# full shape (and the true low/high points, which downsampling always retains).
+ELEVATION_PROFILE_MAX_POINTS = 300
+
+
+def _downsample_elevation_points(points: list[dict[str, Any]], max_points: int) -> list[dict[str, Any]]:
+    """Uniformly downsample elevation samples, always keeping the first, last and
+    the true min/max-altitude points so the chart's low/high markers stay exact."""
+    n = len(points)
+    if n <= max_points:
+        return points
+
+    altitudes = [p["altitude_m"] for p in points]
+    keep: set[int] = {0, n - 1, altitudes.index(min(altitudes)), altitudes.index(max(altitudes))}
+
+    stride = n / max_points
+    keep.update(int(k * stride) for k in range(max_points))
+
+    return [points[i] for i in sorted(keep)]
+
+
+def build_elevation_profile(streams: StravaStreamSetJSON) -> list[dict[str, Any]] | None:
+    """Build an ordered elevation-over-distance profile from Strava streams.
+
+    Pairs each altitude sample with its distance (meters) and elapsed time
+    (seconds). Returns None when there is no usable altitude data (e.g. indoor
+    or manual activities without an altitude stream).
+    """
+    if streams.altitude is None or not streams.altitude.data:
+        return None
+
+    altitudes = streams.altitude.data
+    distances = streams.distance.data if streams.distance else []
+    times = streams.time.data if streams.time else []
+
+    points: list[dict[str, Any]] = []
+    for i, altitude in enumerate(altitudes):
+        if altitude is None:
+            continue
+        distance = distances[i] if i < len(distances) else None
+        time_s = times[i] if i < len(times) else None
+        points.append(
+            {
+                "distance_m": round(float(distance), 1) if distance is not None else None,
+                "altitude_m": round(float(altitude), 1),
+                "time_s": int(time_s) if time_s is not None else None,
+            }
+        )
+
+    if len(points) < 2:
+        return None
+
+    return _downsample_elevation_points(points, ELEVATION_PROFILE_MAX_POINTS)
 
 
 class StravaWorkouts(BaseWorkoutsTemplate):
@@ -125,6 +182,46 @@ class StravaWorkouts(BaseWorkoutsTemplate):
         """Get detailed activity data from Strava API."""
         # hard-coded value - update with base template changes
         return self._make_api_request(db, user_id, f"/api/v3/activities/{workout_id}")
+
+    def get_activity_streams(self, db: DbSession, user_id: UUID, activity_id: str) -> Any:
+        """Fetch altitude/distance/time streams for an activity (key_by_type)."""
+        return self._make_api_request(
+            db,
+            user_id,
+            f"/api/v3/activities/{activity_id}/streams",
+            params={"keys": "distance,altitude,time", "key_by_type": "true"},
+        )
+
+    def _maybe_fetch_elevation_profile(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        raw_workout: StravaActivityJSON,
+    ) -> list[dict[str, Any]] | None:
+        """Fetch and build the elevation profile for GPS/outdoor activities.
+
+        Skips activities with no GPS or elevation (e.g. indoor workouts) to avoid
+        wasted API calls. Network/parse failures are captured but never abort the
+        surrounding sync — the workout is still saved with its summary metrics.
+        """
+        has_gps = raw_workout.map is not None and bool(raw_workout.map.summary_polyline or raw_workout.map.polyline)
+        has_elevation = raw_workout.total_elevation_gain is not None or raw_workout.elev_high is not None
+        if not (has_gps or has_elevation):
+            return None
+
+        try:
+            raw_streams = self.get_activity_streams(db, user_id, str(raw_workout.id))
+            if not isinstance(raw_streams, dict):
+                return None
+            return build_elevation_profile(StravaStreamSetJSON(**raw_streams))
+        except Exception as e:
+            log_and_capture_error(
+                e,
+                self.logger,
+                f"Failed to fetch Strava elevation streams for activity {raw_workout.id}: {e}",
+                extra={"activity_id": raw_workout.id, "user_id": str(user_id)},
+            )
+            return None
 
     def _extract_dates_from_iso(self, start_iso: str, elapsed_time: int) -> tuple[datetime, datetime]:
         """Extract start and end dates from ISO string and elapsed time."""
@@ -246,6 +343,33 @@ class StravaWorkouts(BaseWorkoutsTemplate):
         for raw_workout in raw:
             yield self._normalize_workout(raw_workout, user_id)
 
+    def _save_detail_with_gps(
+        self,
+        db: DbSession,
+        record_id: UUID,
+        detail: EventRecordDetailCreate,
+        profile: list[dict[str, Any]] | None,
+    ) -> None:
+        """Persist a workout's detail, attaching the elevation profile.
+
+        For new workouts create_detail inserts everything. For workouts that
+        already exist, create_detail is a no-op (handle_duplicates), so we also
+        backfill the GPS-derived columns (route_polyline, elevation_profile) so a
+        re-sync refreshes them on previously-synced workouts.
+        """
+        update: dict[str, Any] = {"record_id": record_id}
+        if profile:
+            update["elevation_profile"] = profile
+        detail_for_record = detail.model_copy(update=update)
+        event_record_service.create_detail(db, detail_for_record)
+
+        gps_fields: dict[str, Any] = {}
+        if profile:
+            gps_fields["elevation_profile"] = profile
+        if detail_for_record.route_polyline:
+            gps_fields["route_polyline"] = detail_for_record.route_polyline
+        event_record_service.backfill_workout_detail_fields(db, record_id, gps_fields)
+
     def load_data(
         self,
         db: DbSession,
@@ -300,10 +424,10 @@ class StravaWorkouts(BaseWorkoutsTemplate):
                 )
 
         count = 0
-        for record, detail in self._build_bundles(parsed_activities, user_id):
+        for raw, (record, detail) in zip(parsed_activities, self._build_bundles(parsed_activities, user_id)):
             created_record = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created_record.id})
-            event_record_service.create_detail(db, detail_for_record)
+            profile = self._maybe_fetch_elevation_profile(db, user_id, raw)
+            self._save_detail_with_gps(db, created_record.id, detail, profile)
             count += 1
 
         return count
@@ -328,8 +452,8 @@ class StravaWorkouts(BaseWorkoutsTemplate):
 
         record, detail = self._normalize_workout(activity, user_id)
         created_record = event_record_service.create(db, record)
-        detail_for_record = detail.model_copy(update={"record_id": created_record.id})
-        event_record_service.create_detail(db, detail_for_record)
+        profile = self._maybe_fetch_elevation_profile(db, user_id, activity)
+        self._save_detail_with_gps(db, created_record.id, detail, profile)
         created_ids.append(created_record.id)
 
         return created_ids

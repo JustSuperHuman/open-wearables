@@ -58,3 +58,9 @@ class WorkoutDetails(EventRecordDetail):
     # GPS route encoded with the Google Encoded Polyline Algorithm (precision 5),
     # e.g. Strava's map.summary_polyline. Null for indoor/manual workouts.
     route_polyline: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Ordered elevation-over-distance samples for rebuilding a line chart, e.g.
+    # decoded from Strava's altitude/distance/time streams. Each item is
+    # {"distance_m": float|null, "altitude_m": float, "time_s": int|null}.
+    # Null for indoor/manual workouts or activities without an altitude stream.
+    elevation_profile: Mapped[json_binary | None]
