@@ -283,3 +283,24 @@ bun run deploy secrets redis svix api flower frontend
   migration attempts.
 - The default Redis app is intentionally private. Do not add public services or
   public IPs to `deploy/fly/redis.toml`.
+- `fly deploy` leaves stopped machines stopped. After a deploy, run
+  `fly status -a open-wearables-api` and `fly machine start <id>` any `worker` or
+  `beat` machine that isn't `started`. Without the worker, provider webhooks
+  (Garmin pushes, Strava events) only queue up in Redis.
+- If the web machine hits its restart limit during a deploy, roll back with
+  `fly deploy --image registry.fly.io/open-wearables-api:<previous tag>` (tags from
+  `fly releases --image -a open-wearables-api`), then `fly machine start` the
+  replacement web machine, which Fly creates stopped.
+
+## Production database history
+
+- **2026-10-27, upstream 0.10 merge.** Production was stamped at `a1f4e7c2b9d0`, but
+  upstream's `d8a0bc9afdd9` (`menstrual_cycle_details`), an ancestor of that
+  revision, had never actually run. Upstream's `b2c3d4e5f6a1` then failed on the
+  missing table and the first deploy crash-looped. A schema diff of a prod backup
+  against a fresh DB migrated to `a1f4e7c2b9d0` showed that table as the only
+  drift. The fix was creating it with the exact SQL from
+  `alembic upgrade 264b79d7c541:d8a0bc9afdd9 --sql`, after which `upgrade head`
+  ran cleanly. Before deploying a merge that adds migrations, restore a prod dump
+  into a local Postgres and run `alembic upgrade head` plus the `app.sh` scripts
+  against it first.
