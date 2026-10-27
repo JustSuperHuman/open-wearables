@@ -119,6 +119,53 @@ class EventRecordRepository(
             query = query.filter(DataSource.provider == provider)
         return query.one_or_none()
 
+    def get_all_by_external_id(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_id: str,
+        provider: str,
+        category: EventCategory,
+    ) -> list[EventRecord]:
+        """Every record of one category a provider stored under this external_id for the user.
+
+        Unlike get_by_external_id this tolerates several matches: one provider activity can sit
+        under more than one data source (e.g. the device name changed between deliveries).
+        """
+        return (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                self.model.external_id == external_id,
+                self.model.category == category,
+            )
+            .all()
+        )
+
+    def apply_revision(self, db_session: DbSession, record: EventRecord, revision: EventRecordCreate) -> bool:
+        """Overwrite a stored record's type and time span with a provider's revised version.
+
+        Keeps the id, data source and external_id. Flushes inside a savepoint; the caller commits.
+        Returns False, leaving the row as it was, when the new span collides with another record
+        of the same data source.
+        """
+        nested = db_session.begin_nested()
+        try:
+            record.type = revision.type
+            record.duration_seconds = revision.duration_seconds
+            record.start_datetime = revision.start_datetime
+            record.end_datetime = revision.end_datetime
+            record.zone_offset = revision.zone_offset
+            db_session.flush()
+            nested.commit()
+        except IntegrityError:
+            nested.rollback()
+            return False
+        self._record_coverage(db_session, [(revision, self.data_source_repo.provider_of(revision))])
+        return True
+
     def delete_by_external_id(
         self,
         db_session: DbSession,

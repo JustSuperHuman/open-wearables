@@ -35,6 +35,14 @@ EPOCHS_SERIES: dict[str, SeriesType] = {
     "energy": SeriesType.active_energy,
 }
 
+# Nutrition push summary: dailyNutritionIntake field -> SeriesType, stored as daily totals.
+NUTRITION_SERIES: list[tuple[str, SeriesType]] = [
+    ("kiloCalories", SeriesType.dietary_energy_consumed),
+    ("carbsInGrams", SeriesType.dietary_carbohydrates),
+    ("fatInGrams", SeriesType.dietary_fat_total),
+    ("proteinInGrams", SeriesType.dietary_protein),
+]
+
 TIMESERIES: frozenset[SeriesType] = frozenset(
     {
         *(st for _, st in ACTIVITY_SAMPLE_SERIES),  # /wellness-api/rest/activities (activityDetails + FIT)
@@ -55,6 +63,8 @@ TIMESERIES: frozenset[SeriesType] = frozenset(
         SeriesType.vo2_max,  # /wellness-api/rest/userMetrics
         SeriesType.garmin_fitness_age,  # /wellness-api/rest/userMetrics
         SeriesType.skin_temperature_deviation,  # /wellness-api/rest/skinTemp (avgDeviationCelsius)
+        *(st for _, st in NUTRITION_SERIES),  # nutrition push (daily totals)
+        SeriesType.hydration,  # hydration push (fluidIntakeInML, daily total)
     }
 )
 

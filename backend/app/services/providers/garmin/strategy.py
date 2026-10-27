@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from app.config import settings
 from app.integrations.celery.tasks.garmin.backfill_task import start_full_backfill as start_garmin_full_backfill
 from app.services.providers.base_strategy import (
     BaseProviderStrategy,
@@ -16,8 +17,11 @@ from app.services.providers.garmin.coverage import (
 )
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.services.providers.garmin.training import GarminTrainingService
 from app.services.providers.garmin.webhook_handler import GarminWebhookHandler
 from app.services.providers.garmin.workouts import GarminWorkouts
+from app.services.providers.garmin.write_client import GarminWriteClient
+from app.utils.exceptions import UnsupportedProviderError
 
 
 class GarminStrategy(BaseProviderStrategy):
@@ -27,6 +31,7 @@ class GarminStrategy(BaseProviderStrategy):
     - OAuth 2.0 with PKCE
     - Workouts/activities
     - 24/7 data (sleep, dailies, epochs, body composition)
+    - Pushing workouts, workout schedules and courses (Training API V2, Courses API)
     """
 
     def __init__(self):
@@ -55,6 +60,15 @@ class GarminStrategy(BaseProviderStrategy):
             garmin_247=self.data_247,
             oauth=self.oauth,
         )
+        # Outbound: workouts, schedules and courses written to the user's Garmin Connect account
+        self.training = GarminTrainingService(
+            client=GarminWriteClient(
+                oauth=self.oauth,
+                connection_repo=self.connection_repo,
+                api_base_url=self.api_base_url,
+            ),
+            connection_repo=self.connection_repo,
+        )
 
     @property
     def name(self) -> str:
@@ -69,8 +83,14 @@ class GarminStrategy(BaseProviderStrategy):
         # Garmin delivers the full data payload inside every webhook (PUSH) and
         # also supports an async backfill flow (PING → callback URL fetch).
         # There is no plain REST polling path for wellness data; all data
-        # arrives via the push/backfill mechanism.
-        return ProviderCapabilities(webhook_stream=True, webhook_callback=True, max_historical_days=30)
+        # arrives via the push/backfill mechanism. The backfill API is
+        # Enterprise-only, so it is advertised only while GARMIN_BACKFILL_ENABLED
+        # is on; with it off, connecting a user starts live push data only.
+        return ProviderCapabilities(
+            webhook_stream=True,
+            webhook_callback=settings.garmin_backfill_enabled,
+            max_historical_days=30,
+        )
 
     @property
     def coverage(self) -> ProviderCoverage:
@@ -87,7 +107,14 @@ class GarminStrategy(BaseProviderStrategy):
 
         The ``days`` parameter is ignored - Garmin limits historical access
         to 30 days before the user's consent date.
+
+        Raises UnsupportedProviderError when GARMIN_BACKFILL_ENABLED is off
+        (Starter-tier apps have no access to historical data).
         """
+        if not settings.garmin_backfill_enabled:
+            raise UnsupportedProviderError(
+                self.name, "historical sync on this deployment (GARMIN_BACKFILL_ENABLED=false)"
+            )
         task = start_garmin_full_backfill.delay(str(user_id))
         return HistoricalSyncResult(
             task_id=task.id,

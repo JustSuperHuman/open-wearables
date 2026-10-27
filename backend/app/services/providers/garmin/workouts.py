@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
+from app.constants.devices_map import normalize_device_model
 from app.constants.entry_source import get_unified_garmin_entry_source
 from app.constants.workout_types.garmin import get_unified_workout_type
 from app.database import DbSession
@@ -224,7 +225,9 @@ class GarminWorkouts(BaseWorkoutsTemplate):
 
         metrics = self._build_metrics(raw_workout)
 
-        device_name = raw_workout.deviceName or "Garmin"
+        # Garmin sends "unknown" for activities typed into Connect; its brand rules say to show plain
+        # "Garmin" whenever the device model isn't known.
+        device_name = normalize_device_model(raw_workout.deviceName) or "Garmin"
 
         zone_offset = offset_to_iso(raw_workout.startTimeOffsetInSeconds)
 
@@ -307,3 +310,30 @@ class GarminWorkouts(BaseWorkoutsTemplate):
             created_ids.append(created_record.id)
 
         return created_ids
+
+    def process_manual_updates(
+        self,
+        db: DbSession,
+        activities: list[GarminActivityJSON],
+        user_id: UUID,
+    ) -> list[tuple[UUID, bool]]:
+        """Apply edits the user made in Garmin Connect (``manuallyUpdatedActivities``).
+
+        Garmin re-sends the whole activity summary. The workout stored under the Garmin activity id
+        is overwritten in place; an activity we never stored (e.g. recorded before the user connected)
+        is created. ``manual`` marks the edit here, not a hand-typed entry, so entry_source is left
+        as it was stored.
+
+        Returns (record id, created) for every workout written.
+        """
+        results: list[tuple[UUID, bool]] = []
+        for record, detail in self._build_bundles(activities, user_id):
+            detail = detail.model_copy(update={"entry_source": None})
+            updated_ids = event_record_service.apply_workout_revision(db, user_id, self.provider_name, record, detail)
+            if updated_ids:
+                results.extend((record_id, False) for record_id in updated_ids)
+                continue
+            created_record = event_record_service.create(db, record)
+            event_record_service.create_detail(db, detail.model_copy(update={"record_id": created_record.id}))
+            results.append((created_record.id, True))
+        return results

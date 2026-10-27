@@ -28,7 +28,7 @@ To control the range yourself, set `HISTORICAL_SYNC_ON_CONNECT=false` and call `
 
 | Provider | Max range | Remarks |
 |---|---|---|
-| Garmin | 30 days | Limited to 30 days before the user's connection (consent) date. Requires the `HISTORICAL_DATA_EXPORT` permission. One backfill request per user per timeframe - reconnect to request again. |
+| Garmin | 30 days | Limited to 30 days before the user's connection (consent) date. Requires the `HISTORICAL_DATA_EXPORT` permission, which only Enterprise apps get. One backfill request per user per timeframe - reconnect to request again. Starter apps have no historical data: set `GARMIN_BACKFILL_ENABLED=false` (see [Garmin Starter tier](/providers/garmin-api-integration#starter-tier-no-historical-data)). |
 | Oura | No limit | |
 | Whoop | No limit | |
 | Ultrahuman | No limit | |

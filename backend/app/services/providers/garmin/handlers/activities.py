@@ -1,7 +1,8 @@
 """Garmin activity webhook handler.
 
 Processes a single activity notification — either PUSH (inline data) or
-PING (callbackURL to fetch from Garmin).
+PING (callbackURL to fetch from Garmin) — and ``manuallyUpdatedActivities``
+entries, which carry an activity the user edited in Garmin Connect.
 """
 
 import logging
@@ -156,6 +157,116 @@ def process_activity_notification(
                 "record_ids": [str(rid) for rid in created_ids],
                 "status": "saved",
             }
+        )
+
+    return results
+
+
+def process_manual_activity_update(
+    db: DbSession,
+    connection_repo: UserConnectionRepository,
+    garmin_workouts: GarminWorkouts,
+    notification: dict[str, Any],
+    request_trace_id: str,
+) -> list[dict[str, Any]]:
+    """Apply one ``manuallyUpdatedActivities`` entry (an activity edited in Garmin Connect).
+
+    Every OW profile linked to the Garmin account gets the edit. Returns one result per profile
+    with status ``updated`` (a stored workout was overwritten) or ``saved`` (it was new to us).
+    """
+    garmin_user_id: str | None = notification.get("userId")
+    # Garmin uses the activity id as an activity's summaryId; the spec's example for this type
+    # leaves activityId out, so fall back to it.
+    activity_id = notification.get("activityId") or notification.get("summaryId")
+    base_result: dict[str, Any] = {
+        "activity_id": activity_id,
+        "type": notification.get("activityType"),
+        "garmin_user_id": garmin_user_id,
+        "manual_update": True,
+    }
+
+    if not garmin_user_id:
+        return [{**base_result, "status": "user_not_found", "error": "Missing userId in manual activity update"}]
+
+    connections = connection_repo.get_all_by_provider_user_id(db, "garmin", garmin_user_id)
+    if not connections:
+        log_structured(
+            logger,
+            "warning",
+            "No connection found for Garmin user (manual activity update)",
+            provider="garmin",
+            trace_id=request_trace_id,
+            garmin_user_id=garmin_user_id,
+        )
+        return [{**base_result, "status": "user_not_found", "error": f"User {garmin_user_id} not connected"}]
+
+    try:
+        activity = GarminActivityJSON.model_validate({**notification, "activityId": activity_id})
+    except ValidationError as e:
+        log_structured(
+            logger,
+            "error",
+            "Failed to parse manually updated activity",
+            provider="garmin",
+            trace_id=request_trace_id,
+            activity_id=activity_id,
+            error=str(e),
+        )
+        err_result = {**base_result, "status": "validation_error", "error": f"Invalid activity data: {e}"}
+        return [err_result for _ in connections]
+
+    primary_user_id: UUID = connections[0].user_id
+    results: list[dict[str, Any]] = []
+
+    for i, connection in enumerate(connections):
+        internal_user_id = connection.user_id
+        trace_id = get_trace_id(internal_user_id) or request_trace_id
+        is_primary = i == 0
+        sync_source = SyncSource.WEBHOOK if is_primary else SyncSource.LINKED_ACCOUNT
+        run_id = new_run_id(prefix=f"garmin_webhook_activity_update_{activity_id}")
+        try:
+            with sync_run_context(SyncRunContext(run_id=run_id, source=sync_source, scope=SyncScope.LIVE)):
+                written = garmin_workouts.process_manual_updates(db=db, activities=[activity], user_id=internal_user_id)
+        except IntegrityError:
+            db.rollback()
+            log_structured(
+                logger,
+                "info",
+                "Manually updated activity conflicts with a stored record, skipping",
+                provider="garmin",
+                trace_id=trace_id,
+                activity_id=activity_id,
+                user_id=str(internal_user_id),
+            )
+            results.append({**base_result, "internal_user_id": str(internal_user_id), "status": "duplicate"})
+            continue
+
+        status = "saved" if any(created for _, created in written) else "updated"
+        record_ids = [str(record_id) for record_id, _ in written]
+        log_structured(
+            logger,
+            "info" if is_primary else "debug",
+            "Applied Garmin manual activity update",
+            provider="garmin",
+            trace_id=trace_id,
+            activity_id=activity_id,
+            user_id=str(internal_user_id),
+            status=status,
+            record_ids=record_ids,
+        )
+        emit_sync_completed(
+            internal_user_id,
+            "garmin",
+            sync_source,
+            run_id=run_id,
+            status=SyncStatus.SUCCESS,
+            message="Garmin activity edited in Garmin Connect",
+            items_processed=len(written),
+            primary_user_id=None if is_primary else primary_user_id,
+            metadata={"trace_id": trace_id, "activity_id": activity_id, "manual_update": True},
+        )
+        results.append(
+            {**base_result, "internal_user_id": str(internal_user_id), "record_ids": record_ids, "status": status}
         )
 
     return results

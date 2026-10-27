@@ -190,6 +190,13 @@ class Settings(BaseSettings):
     garmin_client_secret: SecretStr | None = None
     garmin_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     garmin_default_scope: str = ""  # Scope is managed at app creation in Garmin Developer Portal
+    # Garmin's historical-data (backfill) API is Enterprise-only. Starter-tier apps get push data from the
+    # moment a user connects and nothing older, so set this to false there: no backfill is triggered on
+    # connect, from /sync/historical or from webhook chaining.
+    garmin_backfill_enabled: bool = True
+    # Shown to users in Garmin Connect as the workout's source when a pushed workout doesn't set
+    # workoutProvider / workoutSourceId itself. Garmin caps both fields at 20 characters.
+    garmin_workout_provider: str = Field("JustGains", min_length=1, max_length=20)
 
     # POLAR OAUTH SETTINGS
     polar_client_id: str | None = None

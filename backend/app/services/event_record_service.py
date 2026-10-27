@@ -80,6 +80,7 @@ from app.utils.context import current_sync_payload
 from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
+from app.utils.structured_logging import log_structured
 
 
 def _meal_summary(nutrients: dict[SeriesType, float]) -> tuple[float | None, Macros | None, float | None]:
@@ -218,6 +219,54 @@ class EventRecordService(
             return
         self.event_record_detail_repo.update_workout_fields(db_session, record_id, fields)
         db_session.commit()
+
+    def apply_workout_revision(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        record: EventRecordCreate,
+        detail: EventRecordDetailCreate,
+    ) -> list[UUID]:
+        """Overwrite the stored workouts that carry ``record.external_id`` with a provider's revised version.
+
+        For activities edited at the provider after we stored them. create() can't apply an edit: it is
+        insert-or-return-existing on (data source, start, end), so a new start or duration inserts a
+        second workout and an unchanged span keeps the stale values. Only non-null detail values are
+        written, so fields the revision doesn't carry (FIT segments, zones, route) are kept.
+
+        Returns the ids of the records updated; empty when nothing is stored under that external_id.
+        """
+        if not record.external_id:
+            return []
+        stored = self.crud.get_all_by_external_id(
+            db_session, user_id, record.external_id, provider, EventCategory.WORKOUT
+        )
+        workout_columns = set(WorkoutDetails.__table__.columns.keys()) - {"record_id"}
+        fields = {k: v for k, v in detail.model_dump(exclude_none=True).items() if k in workout_columns}
+
+        updated: list[UUID] = []
+        for existing in stored:
+            if not self.crud.apply_revision(db_session, existing, record):
+                log_structured(
+                    self.logger,
+                    "warning",
+                    "Revised workout span collides with another record, revision skipped",
+                    provider=provider,
+                    action="workout_revision_conflict",
+                    user_id=str(user_id),
+                    record_id=str(existing.id),
+                )
+                continue
+            if self.event_record_detail_repo.get_by_record_id(db_session, existing.id, EventCategory.WORKOUT) is None:
+                self.event_record_detail_repo.create_and_flush(
+                    db_session, detail.model_copy(update={"record_id": existing.id})
+                )
+            elif fields:
+                self.event_record_detail_repo.update_workout_fields(db_session, existing.id, fields)
+            updated.append(existing.id)
+        db_session.commit()
+        return updated
 
     @staticmethod
     def _to_local(dt: datetime, zone_offset: str | None) -> datetime:

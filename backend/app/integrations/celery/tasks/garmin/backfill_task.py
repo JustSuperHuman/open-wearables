@@ -14,6 +14,7 @@ from uuid import UUID
 
 from celery import shared_task
 
+from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.integrations.celery.tasks.garmin.backfill_trigger import trigger_backfill_for_type
@@ -129,6 +130,18 @@ def start_full_backfill(user_id: str) -> dict[str, Any]:
             error=str(e),
         )
         return {"error": f"Invalid user_id: {e}"}
+
+    # Checked before any backfill state is written, so a disabled backfill leaves no lock,
+    # sync run or pending type behind for the connection.
+    if not settings.garmin_backfill_enabled:
+        log_structured(
+            logger,
+            "info",
+            "Skipping backfill -- GARMIN_BACKFILL_ENABLED is off",
+            provider="garmin",
+            user_id=user_id,
+        )
+        return {"status": "skipped", "reason": "Garmin backfill is disabled (GARMIN_BACKFILL_ENABLED=false)"}
 
     # Skip backfill only when we *know* the user hasn't granted HISTORICAL_DATA_EXPORT.
     # scope=None means the permissions fetch failed during OAuth (best-effort) and the
@@ -355,6 +368,8 @@ def trigger_next_pending_type(user_id: str) -> dict[str, Any]:
 
     Called after a webhook receives data for a type, or after a type fails.
     """
+    if not settings.garmin_backfill_enabled:
+        return {"status": "skipped", "reason": "Garmin backfill is disabled (GARMIN_BACKFILL_ENABLED=false)"}
 
     trace_id = get_trace_id(user_id)
 
