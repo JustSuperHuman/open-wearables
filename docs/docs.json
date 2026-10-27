@@ -275,6 +275,19 @@
             ]
           },
           {
+            "group": "Garmin Training",
+            "pages": [
+              "GET /api/v1/users/{user_id}/garmin/permissions",
+              "POST /api/v1/users/{user_id}/garmin/workouts",
+              "PUT /api/v1/users/{user_id}/garmin/workouts/{workout_id}",
+              "DELETE /api/v1/users/{user_id}/garmin/workouts/{workout_id}",
+              "POST /api/v1/users/{user_id}/garmin/schedules",
+              "DELETE /api/v1/users/{user_id}/garmin/schedules/{schedule_id}",
+              "POST /api/v1/users/{user_id}/garmin/courses",
+              "DELETE /api/v1/users/{user_id}/garmin/courses/{course_id}"
+            ]
+          },
+          {
             "group": "Data Sources",
             "pages": [
               "GET /api/v1/users/{user_id}/data-sources"

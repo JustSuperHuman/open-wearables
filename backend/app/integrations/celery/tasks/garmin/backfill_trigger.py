@@ -13,6 +13,7 @@ from celery import current_app as celery_app
 from celery import shared_task
 from fastapi import HTTPException
 
+from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.integrations.celery.tasks.garmin.backfill_timeout import (
@@ -54,6 +55,9 @@ logger = getLogger(__name__)
 @shared_task(name=CeleryTask.GARMIN_TRIGGER_BACKFILL_FOR_TYPE)
 def trigger_backfill_for_type(user_id: str, data_type: str) -> dict[str, Any]:
     """Trigger backfill for a specific data type."""
+    # Also stops a chain already queued when the flag was switched off.
+    if not settings.garmin_backfill_enabled:
+        return {"status": "skipped", "reason": "Garmin backfill is disabled (GARMIN_BACKFILL_ENABLED=false)"}
     if data_type not in BACKFILL_DATA_TYPES:
         return {"error": f"Invalid data type: {data_type}"}
 

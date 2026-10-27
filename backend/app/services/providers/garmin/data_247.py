@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.config import settings
+from app.constants.devices_map import normalize_device_model
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.models import DataPointSeries, EventRecord, EventRecordDetail
@@ -31,7 +32,12 @@ from app.services.event_record_service import event_record_service
 from app.services.fit_parser import parse_fit_file
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import download_binary_content, make_authenticated_request
-from app.services.providers.garmin.coverage import ACTIVITY_SAMPLE_SERIES, DAILIES_SERIES, EPOCHS_SERIES
+from app.services.providers.garmin.coverage import (
+    ACTIVITY_SAMPLE_SERIES,
+    DAILIES_SERIES,
+    EPOCHS_SERIES,
+    NUTRITION_SERIES,
+)
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -58,6 +64,12 @@ class Garmin247Data(Base247DataTemplate):
     - Maximum query range: 24 hours per request
     - Data retention: ~7 days (backfill service can retrieve up to 5 years)
     - Parameters: uploadStartTimeInSeconds, uploadEndTimeInSeconds
+
+    Device attribution: only Activity API payloads name the device (``deviceName`` on activities,
+    activityDetails summaries, activityFiles and manuallyUpdatedActivities), so only records and
+    samples built from those carry a device_model. Health API and Women's Health summaries
+    (dailies, sleeps, HRV, stress, nutrition, ...) have no device field; their data is attributed
+    to plain "Garmin", as Garmin's brand guidelines ask when the model isn't known.
     """
 
     CHUNK_HOURS = 24  # Garmin API max range per request
@@ -1056,6 +1068,7 @@ class Garmin247Data(Base247DataTemplate):
 
         summary = raw_activity_details.get("summary", {})
         zone_offset = offset_to_iso(summary.get("startTimeOffsetInSeconds"))
+        device_model = summary.get("deviceName")
 
         result: list[TimeSeriesSampleCreate] = []
         for sample in samples:
@@ -1072,6 +1085,7 @@ class Garmin247Data(Base247DataTemplate):
                         id=uuid4(),
                         user_id=user_id,
                         source=self.provider_name,
+                        device_model=device_model,
                         recorded_at=recorded_at,
                         zone_offset=zone_offset,
                         value=Decimal(str(value)),
@@ -1699,6 +1713,69 @@ class Garmin247Data(Base247DataTemplate):
         return counts
 
     # -------------------------------------------------------------------------
+    # Nutrition & Hydration (push only)
+    # -------------------------------------------------------------------------
+
+    def _build_nutrition_samples(
+        self,
+        user_id: UUID,
+        raw_nutrition: dict[str, Any],
+    ) -> list[TimeSeriesSampleCreate]:
+        """Daily macro totals from a nutrition summary (food logged in the Garmin Connect app).
+
+        Stored as daily totals at noon UTC of calendarDate: nutrition summaries carry no timezone
+        offset, and the summary Garmin re-sends after an edit upserts the same rows. The individual
+        loggedFoods are not stored as meals - each has a local time without an offset and no id, so
+        an edited or deleted food could not be matched to what was stored.
+        """
+        recorded_at = self._from_calendar_date(raw_nutrition.get("calendarDate") or "")
+        intake = raw_nutrition.get("dailyNutritionIntake")
+        if recorded_at is None or not isinstance(intake, dict):
+            return []
+
+        samples: list[TimeSeriesSampleCreate] = []
+        for field, series_type in NUTRITION_SERIES:
+            value = intake.get(field)
+            if value is None:
+                continue
+            samples.append(
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    source=self.provider_name,
+                    recorded_at=recorded_at,
+                    value=Decimal(str(value)),
+                    series_type=series_type,
+                    external_id=raw_nutrition.get("summaryId"),
+                    is_daily_total=daily_total_flag(series_type, is_daily=True),
+                )
+            )
+        return samples
+
+    def _build_hydration_samples(
+        self,
+        user_id: UUID,
+        raw_hydration: dict[str, Any],
+    ) -> list[TimeSeriesSampleCreate]:
+        """The day's fluid intake (mL) as a daily total at noon UTC of calendarDate."""
+        recorded_at = self._from_calendar_date(raw_hydration.get("calendarDate") or "")
+        fluid_ml = raw_hydration.get("fluidIntakeInML")
+        if recorded_at is None or fluid_ml is None:
+            return []
+        return [
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                source=self.provider_name,
+                recorded_at=recorded_at,
+                value=Decimal(str(fluid_ml)),
+                series_type=SeriesType.hydration,
+                external_id=raw_hydration.get("summaryId"),
+                is_daily_total=daily_total_flag(SeriesType.hydration, is_daily=True),
+            )
+        ]
+
+    # -------------------------------------------------------------------------
     # Move IQ - /wellness-api/rest/moveiq
     # -------------------------------------------------------------------------
 
@@ -1912,6 +1989,10 @@ class Garmin247Data(Base247DataTemplate):
                         all_samples.extend(self._build_skin_temp_samples(user_id, item))
                     case "healthSnapshot":
                         all_samples.extend(self._build_health_snapshot_samples(user_id, item))
+                    case "nutrition":
+                        all_samples.extend(self._build_nutrition_samples(user_id, item))
+                    case "hydration":
+                        all_samples.extend(self._build_hydration_samples(user_id, item))
 
                     # EventRecord types - accumulate records + details
                     case "sleeps":
@@ -2031,8 +2112,12 @@ class Garmin247Data(Base247DataTemplate):
                                 )
                         fit_samples: list[TimeSeriesSampleCreate] = []
                         if settings.ingest_workout_samples:
+                            # File the samples under the recording device, like the workout itself.
+                            fit_device = normalize_device_model(item.get("deviceName"))
                             fit_samples = [
-                                s for s in fit_result.samples if s.series_type not in _ACTIVITY_DETAILS_SERIES_TYPES
+                                s.model_copy(update={"device_model": fit_device})
+                                for s in fit_result.samples
+                                if s.series_type not in _ACTIVITY_DETAILS_SERIES_TYPES
                             ]
                             all_samples.extend(fit_samples)
                         log_structured(

@@ -6,7 +6,9 @@ payload, enqueues a Celery task for async processing, and returns
 never exceeded.
 
 PING (callbackURL-based) mode is not supported — those notifications are
-ignored and the endpoint still returns 200 so Garmin stops retrying.
+ignored and the endpoint still returns 200 so Garmin stops retrying. The same
+goes for push types OW has no mapping for (see ``UNMAPPED_TYPES``): they are
+logged at debug level and dropped.
 """
 
 import contextlib
@@ -28,7 +30,10 @@ from app.services.providers.garmin.backfill_state import (
     mark_type_success,
 )
 from app.services.providers.garmin.data_247 import Garmin247Data
-from app.services.providers.garmin.handlers.activities import process_activity_notification
+from app.services.providers.garmin.handlers.activities import (
+    process_activity_notification,
+    process_manual_activity_update,
+)
 from app.services.providers.garmin.handlers.lifecycle import (
     process_deregistrations,
     process_user_permissions,
@@ -57,9 +62,17 @@ WELLNESS_TYPES: list[str] = [
     "mct",
     "userMetrics",
     "bloodPressures",
+    "nutrition",
+    "hydration",
     "activityDetails",
     "activityFiles",
 ]
+
+# Push types Garmin sends that OW deliberately stores nothing for. breathingVariations reports a
+# sleep breathing-variation level (MINIMAL / FEW / OCCASIONAL / FREQUENT) that no series type fits;
+# like every Garmin push, the raw body is still kept by raw payload storage when RAW_PAYLOAD_STORAGE
+# is enabled. Unknown types Garmin adds later are treated the same way.
+UNMAPPED_TYPES: frozenset[str] = frozenset({"breathingVariations"})
 
 
 class GarminWebhookHandler(BaseWebhookHandler):
@@ -193,7 +206,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
 
         # --- data processing ---------------------------------------------
         act_result = self._process_activities(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
+        manual_result = self._process_manual_activity_updates(db, payload, errors, synced_user_ids, trace_id)
         well_result = self._process_wellness(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
+        ignored = self._log_unmapped_types(payload, trace_id)
 
         # --- commit + update last_synced_at ------------------------------
         db.commit()
@@ -210,7 +225,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
             "saved": act_result["saved_count"],
             "errors": errors,
             "activities": act_result["details"],
+            "manuallyUpdatedActivities": manual_result,
             "wellness": well_result,
+            "ignored": ignored,
             "backfill_chained": [],
         }
 
@@ -258,6 +275,59 @@ class GarminWebhookHandler(BaseWebhookHandler):
                     errors.append(result.get("error", "Unknown error"))
 
         return {"processed_count": processed_count, "saved_count": saved_count, "details": details}
+
+    def _process_manual_activity_updates(
+        self,
+        db: DbSession,
+        payload: dict[str, Any],
+        errors: list[str],
+        synced_user_ids: set[UUID],
+        request_trace_id: str,
+    ) -> dict[str, Any]:
+        """Apply activities the user edited in Garmin Connect to the stored workouts."""
+        updated_count = 0
+        saved_count = 0
+        details: list[dict[str, Any]] = []
+
+        for notification in payload.get("manuallyUpdatedActivities") or []:
+            if not isinstance(notification, dict):
+                continue
+            per_profile_results = process_manual_activity_update(
+                db, self.connection_repo, self.garmin_workouts, notification, request_trace_id
+            )
+            details.extend(per_profile_results)
+            for result in per_profile_results:
+                status = result.get("status")
+                uid_str = result.get("internal_user_id")
+                if status in ("updated", "saved"):
+                    if status == "updated":
+                        updated_count += 1
+                    else:
+                        saved_count += 1
+                    if uid_str:
+                        synced_user_ids.add(UUID(uid_str))
+                elif status in ("validation_error", "user_not_found"):
+                    errors.append(result.get("error", "Unknown error"))
+
+        return {"updated": updated_count, "saved": saved_count, "details": details}
+
+    def _log_unmapped_types(self, payload: dict[str, Any], request_trace_id: str) -> list[str]:
+        """Debug-log push types OW stores nothing for; returns their names."""
+        handled = set(self.supported_event_types())
+        ignored = {
+            key: len(value) if isinstance(value, list) else 1 for key, value in payload.items() if key not in handled
+        }
+        if ignored:
+            log_structured(
+                logger,
+                "debug",
+                "Ignoring Garmin push types OW does not map",
+                provider="garmin",
+                trace_id=request_trace_id,
+                item_counts=ignored,
+                known_unmapped=sorted(UNMAPPED_TYPES & ignored.keys()),
+            )
+        return sorted(ignored)
 
     def _process_wellness(
         self,
@@ -336,6 +406,8 @@ class GarminWebhookHandler(BaseWebhookHandler):
                 response["deregistrations"] = {"revoked": 0, "errors": [str(e)]}
 
     def _chain_backfills(self, users_with_new_success: set[str], request_trace_id: str) -> list[str]:
+        if not settings.garmin_backfill_enabled:
+            return []
         backfill_triggered: list[str] = []
         for user_id_str in users_with_new_success:
             backfill_status = get_backfill_status(user_id_str)
@@ -356,4 +428,4 @@ class GarminWebhookHandler(BaseWebhookHandler):
         return backfill_triggered
 
     def supported_event_types(self) -> list[str]:
-        return ["activities", *WELLNESS_TYPES, "userPermissionsChange", "deregistrations"]
+        return ["activities", "manuallyUpdatedActivities", *WELLNESS_TYPES, "userPermissionsChange", "deregistrations"]

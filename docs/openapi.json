@@ -3824,6 +3824,1054 @@
         }
       }
     },
+    "/api/v1/users/{user_id}/garmin/permissions": {
+      "get": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Get Garmin Permissions",
+        "description": "Permissions the user grants this app in Garmin Connect.\n\nRead live from Garmin and stored on the connection. When Garmin can't be reached, the stored\npermissions (kept current by Garmin's userPermissionsChange pushes) are returned instead. A user\nwithout an active Garmin connection gets `connected: false` and no permissions.",
+        "operationId": "get_garmin_permissions_api_v1_users__user_id__garmin_permissions_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminPermissionsRead"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/garmin/workouts": {
+      "post": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Create Garmin Workout",
+        "description": "Create a workout in the user's Garmin Connect account (needs WORKOUT_IMPORT).\n\nChecked before sending: `sport` is set, at most 100 steps for a single-sport workout, and at\nmost 25 segments and 250 steps for `MULTI_SPORT`. Repeat blocks count as steps.",
+        "operationId": "create_garmin_workout_api_v1_users__user_id__garmin_workouts_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A Garmin Training API V2 workout object. workoutProvider and workoutSourceId default to GARMIN_WORKOUT_PROVIDER when left out.",
+                "title": "Workout"
+              },
+              "examples": {
+                "tempo_run": {
+                  "summary": "Single-sport running workout",
+                  "value": {
+                    "workoutName": "Tempo Tuesday",
+                    "description": "15 min easy, 4 x 5 min at tempo, 10 min easy",
+                    "sport": "RUNNING",
+                    "segments": [
+                      {
+                        "segmentOrder": 1,
+                        "sport": "RUNNING",
+                        "steps": [
+                          {
+                            "type": "WorkoutStep",
+                            "stepOrder": 1,
+                            "intensity": "WARMUP",
+                            "durationType": "TIME",
+                            "durationValue": 900,
+                            "targetType": "OPEN"
+                          },
+                          {
+                            "type": "WorkoutRepeatStep",
+                            "stepOrder": 2,
+                            "repeatType": "REPEAT_UNTIL_STEPS_CMPLT",
+                            "repeatValue": 4,
+                            "steps": [
+                              {
+                                "type": "WorkoutStep",
+                                "stepOrder": 3,
+                                "intensity": "INTERVAL",
+                                "durationType": "TIME",
+                                "durationValue": 300,
+                                "targetType": "PACE",
+                                "targetValueLow": 3.58,
+                                "targetValueHigh": 3.83
+                              },
+                              {
+                                "type": "WorkoutStep",
+                                "stepOrder": 4,
+                                "intensity": "RECOVERY",
+                                "durationType": "TIME",
+                                "durationValue": 90,
+                                "targetType": "OPEN"
+                              }
+                            ]
+                          },
+                          {
+                            "type": "WorkoutStep",
+                            "stepOrder": 5,
+                            "intensity": "COOLDOWN",
+                            "durationType": "TIME",
+                            "durationValue": 600,
+                            "targetType": "OPEN"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminWorkoutResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/garmin/workouts/{workout_id}": {
+      "put": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Update Garmin Workout",
+        "description": "Replace a workout with a full new version (needs WORKOUT_IMPORT).\n\nGarmin requires `ownerId` on updates. Send the one from the create response; when it is left\nout, OW reads it from Garmin first, which costs one extra Garmin call.",
+        "operationId": "update_garmin_workout_api_v1_users__user_id__garmin_workouts__workout_id__put",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "workout_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Workout Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A Garmin Training API V2 workout object. workoutProvider and workoutSourceId default to GARMIN_WORKOUT_PROVIDER when left out.",
+                "title": "Workout"
+              },
+              "examples": {
+                "tempo_run": {
+                  "summary": "Single-sport running workout",
+                  "value": {
+                    "workoutName": "Tempo Tuesday",
+                    "description": "15 min easy, 4 x 5 min at tempo, 10 min easy",
+                    "sport": "RUNNING",
+                    "segments": [
+                      {
+                        "segmentOrder": 1,
+                        "sport": "RUNNING",
+                        "steps": [
+                          {
+                            "type": "WorkoutStep",
+                            "stepOrder": 1,
+                            "intensity": "WARMUP",
+                            "durationType": "TIME",
+                            "durationValue": 900,
+                            "targetType": "OPEN"
+                          },
+                          {
+                            "type": "WorkoutRepeatStep",
+                            "stepOrder": 2,
+                            "repeatType": "REPEAT_UNTIL_STEPS_CMPLT",
+                            "repeatValue": 4,
+                            "steps": [
+                              {
+                                "type": "WorkoutStep",
+                                "stepOrder": 3,
+                                "intensity": "INTERVAL",
+                                "durationType": "TIME",
+                                "durationValue": 300,
+                                "targetType": "PACE",
+                                "targetValueLow": 3.58,
+                                "targetValueHigh": 3.83
+                              },
+                              {
+                                "type": "WorkoutStep",
+                                "stepOrder": 4,
+                                "intensity": "RECOVERY",
+                                "durationType": "TIME",
+                                "durationValue": 90,
+                                "targetType": "OPEN"
+                              }
+                            ]
+                          },
+                          {
+                            "type": "WorkoutStep",
+                            "stepOrder": 5,
+                            "intensity": "COOLDOWN",
+                            "durationType": "TIME",
+                            "durationValue": 600,
+                            "targetType": "OPEN"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminWorkoutResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Delete Garmin Workout",
+        "description": "Delete a workout from Garmin Connect. A workout Garmin no longer has counts as deleted.",
+        "operationId": "delete_garmin_workout_api_v1_users__user_id__garmin_workouts__workout_id__delete",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "workout_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Workout Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/garmin/schedules": {
+      "post": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Create Garmin Schedule",
+        "description": "Put a pushed workout on the user's Garmin calendar for one day (needs WORKOUT_IMPORT).",
+        "operationId": "create_garmin_schedule_api_v1_users__user_id__garmin_schedules_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GarminScheduleCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminScheduleResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/garmin/schedules/{schedule_id}": {
+      "delete": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Delete Garmin Schedule",
+        "description": "Remove a scheduled workout from the user's Garmin calendar. Already gone counts as deleted.",
+        "operationId": "delete_garmin_schedule_api_v1_users__user_id__garmin_schedules__schedule_id__delete",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Schedule Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/garmin/courses": {
+      "post": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Create Garmin Course",
+        "description": "Create a course (route) in the user's Garmin Connect account (needs COURSE_IMPORT).\n\nChecked before sending: a non-empty `courseName`, at least one geoPoint, and numeric\n`distance`, `elevationGain` and `elevationLoss`, which Garmin does not accept as null.",
+        "operationId": "create_garmin_course_api_v1_users__user_id__garmin_courses_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A Garmin Courses API course object.",
+                "title": "Course"
+              },
+              "examples": {
+                "loop": {
+                  "summary": "Running course",
+                  "value": {
+                    "courseName": "Riverside loop",
+                    "description": "Flat 5 mi loop along the river path",
+                    "distance": 8046.7,
+                    "elevationGain": 31.0,
+                    "elevationLoss": 31.0,
+                    "activityType": "RUNNING",
+                    "coordinateSystem": "WGS84",
+                    "geoPoints": [
+                      {
+                        "latitude": 38.8977,
+                        "longitude": -77.0365,
+                        "elevation": 17.0
+                      },
+                      {
+                        "latitude": 38.8985,
+                        "longitude": -77.0352,
+                        "elevation": 18.5
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminCourseResult"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/garmin/courses/{course_id}": {
+      "delete": {
+        "tags": [
+          "External: Garmin Training"
+        ],
+        "summary": "Delete Garmin Course",
+        "description": "Delete a course from Garmin Connect. A course Garmin no longer has counts as deleted.",
+        "operationId": "delete_garmin_course_api_v1_users__user_id__garmin_courses__course_id__delete",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "course_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Course Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "403": {
+            "description": "garmin_permission_missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "garmin_not_connected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "garmin_validation_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "garmin_rate_limited (Retry-After passed on from Garmin)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/oauth/{provider}/authorize": {
       "get": {
         "tags": [
@@ -13201,6 +14249,138 @@
           "extensions"
         ],
         "title": "ExtensionsResponse"
+      },
+      "GarminCourseResult": {
+        "properties": {
+          "course_id": {
+            "type": "integer",
+            "title": "Course Id",
+            "description": "Garmin courseId"
+          },
+          "course": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Course",
+            "description": "The course as Garmin stored it"
+          }
+        },
+        "type": "object",
+        "required": [
+          "course_id",
+          "course"
+        ],
+        "title": "GarminCourseResult"
+      },
+      "GarminErrorResponse": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail",
+            "description": "What went wrong, including Garmin's own message where it sent one"
+          },
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "garmin_not_connected | garmin_permission_missing | garmin_rate_limited | garmin_validation_error | garmin_upstream_error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail",
+          "code"
+        ],
+        "title": "GarminErrorResponse"
+      },
+      "GarminPermissionsRead": {
+        "properties": {
+          "connected": {
+            "type": "boolean",
+            "title": "Connected",
+            "description": "Whether the user has an active Garmin connection"
+          },
+          "garmin_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Garmin User Id",
+            "description": "Garmin's API user id for this connection"
+          },
+          "permissions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Permissions",
+            "description": "Permissions the user grants this app, e.g. WORKOUT_IMPORT, COURSE_IMPORT, ACTIVITY_EXPORT"
+          }
+        },
+        "type": "object",
+        "required": [
+          "connected"
+        ],
+        "title": "GarminPermissionsRead"
+      },
+      "GarminScheduleCreate": {
+        "properties": {
+          "workout_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Workout Id",
+            "description": "Garmin workoutId of a workout already pushed for this user"
+          },
+          "date": {
+            "type": "string",
+            "format": "date",
+            "title": "Date",
+            "description": "Calendar day to schedule the workout on (YYYY-MM-DD)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workout_id",
+          "date"
+        ],
+        "title": "GarminScheduleCreate"
+      },
+      "GarminScheduleResult": {
+        "properties": {
+          "schedule_id": {
+            "type": "integer",
+            "title": "Schedule Id",
+            "description": "Garmin workout schedule id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schedule_id"
+        ],
+        "title": "GarminScheduleResult"
+      },
+      "GarminWorkoutResult": {
+        "properties": {
+          "workout_id": {
+            "type": "integer",
+            "title": "Workout Id",
+            "description": "Garmin workoutId"
+          },
+          "workout": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Workout",
+            "description": "The workout as Garmin stored it"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workout_id",
+          "workout"
+        ],
+        "title": "GarminWorkoutResult"
       },
       "HRZone": {
         "properties": {

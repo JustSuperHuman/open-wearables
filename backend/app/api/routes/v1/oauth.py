@@ -115,6 +115,7 @@ def oauth_callback(
     # Controlled by HISTORICAL_SYNC_ON_CONNECT (default: true).
     if settings.historical_sync_on_connect:
         caps = strategy.capabilities
+        # Garmin reports webhook_callback only while GARMIN_BACKFILL_ENABLED is on (Starter apps get no history).
         if caps.webhook_callback:
             start_garmin_full_backfill.delay(str(oauth_state.user_id))
         elif caps.rest_pull:

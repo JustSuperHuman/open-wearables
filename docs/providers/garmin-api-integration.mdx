@@ -41,7 +41,7 @@ Garmin has reopened the [Garmin Connect Developer Program](https://developer.gar
 | Technical support | - | Included |
 | How to get it | Create an app with Starter access after joining the program | Request through the Garmin Developer Portal, commercial terms agreed with Garmin |
 
-Open Wearables works with push delivery, so both tiers are supported. Starter doesn't include historical data, so the backfill described below is only available on Enterprise. You can move from Starter to Enterprise later.
+Open Wearables works with push delivery, so both tiers are supported. Starter doesn't include historical data, so the backfill described below is only available on Enterprise; on a Starter app, set `GARMIN_BACKFILL_ENABLED=false` (see [Starter tier: no historical data](#starter-tier-no-historical-data)). You can move from Starter to Enterprise later.
 
 Garmin describes both business tiers as intended for organizations (company, university, hospital, research institution, etc.). Individuals who only need their own data should look at the Personal API below.
 
@@ -186,6 +186,12 @@ API_BASE_URL=http://localhost:8000
 # Garmin OAuth Credentials
 GARMIN_CLIENT_ID=your_client_id_here
 GARMIN_CLIENT_SECRET=your_client_secret_here
+
+# Starter apps have no historical data access: turn the backfill off (default: true)
+GARMIN_BACKFILL_ENABLED=false
+
+# Source name Garmin Connect shows on workouts you push (max 20 characters, default: JustGains)
+GARMIN_WORKOUT_PROVIDER=YourApp
 ```
 
     <Note>
@@ -204,6 +210,177 @@ GARMIN_CLIENT_SECRET=your_client_secret_here
     </Warning>
   </Step>
 </Steps>
+
+## Starter tier: no historical data
+
+Starter apps get push data from the moment a user connects, and nothing older. Garmin's backfill API is Enterprise-only, so on a Starter app every backfill request would fail. Set:
+
+```bash
+GARMIN_BACKFILL_ENABLED=false
+```
+
+With the flag off:
+
+- Connecting a user through OAuth doesn't start a backfill, even with `HISTORICAL_SYNC_ON_CONNECT=true`. The connection is `active` straight away and no historical sync run is created for it.
+- `POST /api/v1/providers/garmin/users/{user_id}/sync/historical` answers `400` with a message naming the flag.
+- `GET /api/v1/users/{user_id}/connections` reports `webhook_callback: false` for Garmin, so clients can hide "sync history" options.
+- Live pushes never chain into backfill requests, and any backfill task still queued from before the switch stops without calling Garmin.
+
+The flag defaults to `true`, which keeps the Enterprise behaviour described above.
+
+## Pushing workouts, schedules and courses
+
+If your app has the Training API and Courses API enabled, Open Wearables can write to a user's Garmin Connect account for you. Your backend never handles Garmin tokens: it calls these endpoints with your Open Wearables API key, and Open Wearables makes the Garmin call with the stored connection, refreshing the token when needed.
+
+| Method | Path | Needs permission | Success |
+|---|---|---|---|
+| `GET` | `/api/v1/users/{user_id}/garmin/permissions` | - | `200` |
+| `POST` | `/api/v1/users/{user_id}/garmin/workouts` | `WORKOUT_IMPORT` | `201` |
+| `PUT` | `/api/v1/users/{user_id}/garmin/workouts/{workout_id}` | `WORKOUT_IMPORT` | `200` |
+| `DELETE` | `/api/v1/users/{user_id}/garmin/workouts/{workout_id}` | `WORKOUT_IMPORT` | `204` |
+| `POST` | `/api/v1/users/{user_id}/garmin/schedules` | `WORKOUT_IMPORT` | `201` |
+| `DELETE` | `/api/v1/users/{user_id}/garmin/schedules/{schedule_id}` | `WORKOUT_IMPORT` | `204` |
+| `POST` | `/api/v1/users/{user_id}/garmin/courses` | `COURSE_IMPORT` | `201` |
+| `DELETE` | `/api/v1/users/{user_id}/garmin/courses/{course_id}` | `COURSE_IMPORT` | `204` |
+
+Users choose permissions on Garmin's consent screen and can change them later in Garmin Connect, so check `/garmin/permissions` before offering "Send to Garmin". It reads the permissions live from Garmin, stores them on the connection, and falls back to the stored ones (kept current by Garmin's `userPermissionsChange` push) when Garmin can't be reached:
+
+```bash
+curl https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/permissions \
+  -H "X-Open-Wearables-API-Key: $OW_API_KEY"
+```
+
+```json
+{
+  "connected": true,
+  "garmin_user_id": "7c2e91f04ab35d6e8f10c4a9b2d7e3f5",
+  "permissions": ["ACTIVITY_EXPORT", "COURSE_IMPORT", "HEALTH_EXPORT", "MCT_EXPORT", "WORKOUT_IMPORT"]
+}
+```
+
+A user without an active Garmin connection gets `{"connected": false, "garmin_user_id": null, "permissions": []}`.
+
+### Workouts
+
+The body is a Garmin Training API V2 workout object, sent to Garmin as you wrote it. Open Wearables fills in `workoutProvider` and `workoutSourceId` (the source name Garmin Connect shows the user) from `GARMIN_WORKOUT_PROVIDER` when you leave them out.
+
+```bash
+curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/workouts \
+  -H "X-Open-Wearables-API-Key: $OW_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workoutName": "Tempo Tuesday",
+    "description": "15 min easy, 4 x 5 min at tempo, 10 min easy",
+    "sport": "RUNNING",
+    "segments": [{
+      "segmentOrder": 1,
+      "sport": "RUNNING",
+      "steps": [
+        {"type": "WorkoutStep", "stepOrder": 1, "intensity": "WARMUP", "durationType": "TIME", "durationValue": 900, "targetType": "OPEN"},
+        {"type": "WorkoutRepeatStep", "stepOrder": 2, "repeatType": "REPEAT_UNTIL_STEPS_CMPLT", "repeatValue": 4, "steps": [
+          {"type": "WorkoutStep", "stepOrder": 3, "intensity": "INTERVAL", "durationType": "TIME", "durationValue": 300,
+           "targetType": "PACE", "targetValueLow": 3.58, "targetValueHigh": 3.83},
+          {"type": "WorkoutStep", "stepOrder": 4, "intensity": "RECOVERY", "durationType": "TIME", "durationValue": 90, "targetType": "OPEN"}
+        ]},
+        {"type": "WorkoutStep", "stepOrder": 5, "intensity": "COOLDOWN", "durationType": "TIME", "durationValue": 600, "targetType": "OPEN"}
+      ]
+    }]
+  }'
+```
+
+```json
+{
+  "workout_id": 98765432,
+  "workout": {
+    "workoutId": 98765432,
+    "ownerId": 41925377,
+    "workoutName": "Tempo Tuesday",
+    "sport": "RUNNING",
+    "workoutProvider": "YourApp",
+    "workoutSourceId": "YourApp",
+    "segments": ["..."]
+  }
+}
+```
+
+`workout` is whatever Garmin returned. Keep `workout_id` to update, schedule or delete the workout later, and keep `ownerId` too: Garmin requires it on updates. If an update body leaves `ownerId` out, Open Wearables reads it from Garmin first, which costs one extra Garmin call. An update answers `200` with the same `{"workout_id", "workout"}` shape.
+
+Before calling Garmin, Open Wearables checks that `sport` is set and that the workout stays within Garmin's step limits: 100 steps for a single-sport workout, 25 segments and 250 steps for `MULTI_SPORT`. A repeat block counts as a step, and so does every step inside it. `workoutProvider` and `workoutSourceId` may be at most 20 characters. Everything else (step types, exercise categories and names, targets) is validated by Garmin; its message comes back in a `garmin_validation_error`. Garmin expects speed targets, pace included, in meters per second, so convert from min/mi before sending.
+
+### Schedules
+
+Put a pushed workout on the user's Garmin calendar:
+
+```bash
+curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/schedules \
+  -H "X-Open-Wearables-API-Key: $OW_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"workout_id": 98765432, "date": "2026-11-03"}'
+```
+
+```json
+{"schedule_id": 1203384}
+```
+
+### Courses
+
+The body is a Garmin Courses API course object. Open Wearables checks for a non-empty `courseName`, at least one entry in `geoPoints`, and numeric `distance`, `elevationGain` and `elevationLoss` (meters), which Garmin doesn't accept as null.
+
+```bash
+curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/courses \
+  -H "X-Open-Wearables-API-Key: $OW_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "courseName": "Riverside loop",
+    "description": "Flat 5 mi loop along the river path",
+    "distance": 8046.7,
+    "elevationGain": 31.0,
+    "elevationLoss": 31.0,
+    "activityType": "RUNNING",
+    "coordinateSystem": "WGS84",
+    "geoPoints": [
+      {"latitude": 38.8977, "longitude": -77.0365, "elevation": 17.0},
+      {"latitude": 38.8985, "longitude": -77.0352, "elevation": 18.5}
+    ]
+  }'
+```
+
+```json
+{"course_id": 41887203, "course": {"courseId": 41887203, "courseName": "Riverside loop", "...": "..."}}
+```
+
+Deleting a workout, schedule or course answers `204`. One Garmin no longer has also answers `204`, so a retried delete is safe.
+
+### Errors
+
+Every failure on these endpoints, request validation included, has the same shape:
+
+```json
+{"detail": "The user hasn't granted WORKOUT_IMPORT to this app in Garmin Connect.", "code": "garmin_permission_missing"}
+```
+
+| Status | `code` | When |
+|---|---|---|
+| `404` | `garmin_not_connected` | No active Garmin connection, or Garmin no longer accepts the stored authorization. Ask the user to reconnect. |
+| `403` | `garmin_permission_missing` | The user hasn't granted the permission the call needs. A stored "not granted" is double-checked with Garmin before refusing. |
+| `422` | `garmin_validation_error` | The request failed Open Wearables' checks, or Garmin rejected it. Garmin's own message is in `detail`. |
+| `429` | `garmin_rate_limited` | Garmin's per-app or per-user rate limit was hit. `Retry-After` is passed on when Garmin sends it. Open Wearables doesn't retry for you. |
+| `502` | `garmin_upstream_error` | Garmin failed, timed out, or answered something unexpected. Safe to retry later. |
+
+Garmin rate-limits Training and Courses API calls per app and per user, with tighter limits on Starter apps. The limits for your tier are in Garmin's Training API and Courses API specifications. Each `/garmin/permissions` call and each update without `ownerId` costs a Garmin call too, so cache permissions instead of checking before every write.
+
+## What Open Wearables stores from Garmin pushes
+
+Enable every endpoint in API Tools; anything Open Wearables doesn't store is acknowledged and dropped, so Garmin never retries it.
+
+- **Activities and activity details** become workouts. An activity the user edits in Garmin Connect arrives as `manuallyUpdatedActivities`, and the stored workout is updated in place: type, start, duration, distance, calories, heart rate and name. Fields the edit doesn't carry, such as laps from the FIT file, are kept.
+- **Nutrition** becomes daily totals of `dietary_energy_consumed`, `dietary_carbohydrates`, `dietary_fat_total` and `dietary_protein`. Individual foods aren't stored as meals because Garmin sends them without a timezone or an id.
+- **Hydration** becomes a daily `hydration` total in mL.
+- **Breathing variations** aren't stored: no series type fits a breathing-variation level. With `RAW_PAYLOAD_STORAGE` enabled the raw push is kept like every other Garmin push.
+
+### Device attribution
+
+Garmin's brand guidelines ask for a "Garmin [device model]" attribution next to Garmin data. Workouts carry the model in `source.device`, taken from the `deviceName` Garmin sends with each activity. Per-second workout samples (with `INGEST_WORKOUT_SAMPLES=true`) are filed under the same device. Daily summaries, sleep, HRV, stress, nutrition and the other Health API data come without a device name, so their `source.device` is `null`; show plain "Garmin" for those, as the guidelines ask. Activities typed into Garmin Connect report their device as `unknown`, which Open Wearables stores as `null` too.
 
 # Managin your team
 In the developer portal you can add team members who need access to specifications, internal tools, app credentials, source code, etc. You can manage your team at https://developerportal.garmin.com/teams, or use the Switch company menu (available on most developer portal pages) and select "Manage Company".
