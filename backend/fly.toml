@@ -9,7 +9,7 @@
 # own public 443. Svix runs as its own app too (deploy/fly/svix.toml).
 #
 # First time:   fly launch --no-deploy --copy-config --name open-wearables-api
-# Deploy:       fly deploy --env API_BASE_URL=https://open-wearables-api.fly.dev
+# Deploy:       fly deploy --config fly.toml --app open-wearables-api --ha=false
 app = "open-wearables-api"
 primary_region = "iad"
 
@@ -19,7 +19,16 @@ primary_region = "iad"
 [env]
   ENVIRONMENT = "production"
   API_PORT = "8000"
-  API_BASE_URL = "https://open-wearables-api.fly.dev"
+  # Public URL behind the Cloudflare CNAME. OAuth redirect URIs derive from it
+  # ({API_BASE_URL}/api/v1/oauth/{provider}/callback); Garmin and Strava have the
+  # wearables.api.justgains.com callback registered, so this must match.
+  API_BASE_URL = "https://wearables.api.justgains.com"
+  # Garmin Connect Developer Program "Starter" tier has no historical data, so
+  # the connect-time backfill would only error out.
+  GARMIN_BACKFILL_ENABLED = "false"
+  # Upstream's anonymous usage telemetry (telemetry.openwearables.io). Off: Garmin's
+  # program terms require listing every party that receives anything about its users.
+  TELEMETRY_ENABLED = "false"
   # Point at the internal Redis app (deploy/fly/redis.toml) over Fly 6PN private
   # DNS. Overrides REDIS_HOST=redis from .env (which is docker-compose-local only).
   REDIS_HOST = "open-wearables-redis.internal"
@@ -57,12 +66,21 @@ primary_region = "iad"
   [[http_service.checks]]
     interval = "15s"
     timeout = "5s"
-    grace_period = "30s"
+    # First boot after an upstream merge runs every pending migration plus the
+    # once-per-instance data migrations before uvicorn starts listening.
+    grace_period = "180s"
     method = "GET"
     path = "/docs"
 
 # worker and beat have no inbound traffic; give them their own machine sizing.
+# worker.sh starts two Celery workers (default + Garmin/provider sync queues),
+# which doesn't fit in 1gb.
 [[vm]]
   size = "shared-cpu-1x"
   memory = "1gb"
-  processes = ["web", "worker", "beat"]
+  processes = ["web", "beat"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "2gb"
+  processes = ["worker"]
