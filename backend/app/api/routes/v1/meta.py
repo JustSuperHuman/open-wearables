@@ -1,21 +1,31 @@
-"""Public metadata endpoint — provider coverage matrix."""
+"""Metadata endpoints: the public provider coverage matrix and the installed extensions."""
 
 from contextlib import suppress
 from functools import lru_cache
 
 from fastapi import APIRouter
 
+from app import __version__ as core_version
+from app.extensions import LoadedExtension, get_extensions
 from app.schemas.enums import ProviderName, SeriesType
-from app.schemas.enums.series_types import SERIES_TYPE_CATEGORY_BY_ENUM, SERIES_TYPE_UNIT_BY_ENUM
+from app.schemas.enums.health_score_category import HEALTH_SCORE_DESCRIPTION_BY_ENUM, HealthScoreCategory
+from app.schemas.enums.series_types import (
+    SERIES_TYPE_CATEGORY_BY_ENUM,
+    SERIES_TYPE_DESCRIPTION_BY_ENUM,
+    SERIES_TYPE_UNIT_BY_ENUM,
+)
 from app.schemas.model_crud.coverage import (
     CoverageResponse,
     HealthScore,
+    MealField,
     MenstrualCycleField,
     SleepField,
     TimeseriesCategory,
     TimeseriesMetric,
     WorkoutField,
 )
+from app.schemas.responses.extensions import ExtensionInfo, ExtensionsResponse
+from app.services.api_key_service import ApiKeyDep
 from app.services.providers.base_strategy import ProviderCoverage
 from app.services.providers.factory import ProviderFactory
 
@@ -34,6 +44,7 @@ _CATEGORY_ORDER = [
     "Activity - Generic",
     "Environmental",
     "Provider-Specific",
+    "Nutrition",
     "Other",
 ]
 
@@ -57,7 +68,10 @@ def _build_coverage() -> CoverageResponse:
     for st, prov_list in sorted(series_to_providers.items(), key=lambda x: x[0].value):
         cat = SERIES_TYPE_CATEGORY_BY_ENUM.get(st, "Other")
         unit = SERIES_TYPE_UNIT_BY_ENUM.get(st, "")
-        categories.setdefault(cat, []).append(TimeseriesMetric(code=st.value, unit=unit, providers=sorted(prov_list)))
+        description = SERIES_TYPE_DESCRIPTION_BY_ENUM.get(st, "")
+        categories.setdefault(cat, []).append(
+            TimeseriesMetric(code=st.value, unit=unit, description=description, providers=sorted(prov_list))
+        )
 
     timeseries = [TimeseriesCategory(name=cat, metrics=categories[cat]) for cat in _CATEGORY_ORDER if cat in categories]
 
@@ -92,6 +106,14 @@ def _build_coverage() -> CoverageResponse:
         for f, prov_list in sorted(menstrual_to_providers.items())
     ]
 
+    # --- Meal fields ---
+    meal_to_providers: dict[str, list[str]] = {}
+    for provider, cov in coverage_by_provider.items():
+        for f in cov.meal_fields:
+            meal_to_providers.setdefault(f, []).append(provider)
+
+    meal_fields = [MealField(code=f, providers=sorted(prov_list)) for f, prov_list in sorted(meal_to_providers.items())]
+
     # --- Health scores ---
     score_to_providers: dict[str, list[str]] = {}
     for provider, cov in coverage_by_provider.items():
@@ -99,7 +121,12 @@ def _build_coverage() -> CoverageResponse:
             score_to_providers.setdefault(score.value, []).append(provider)
 
     health_scores = [
-        HealthScore(code=score, providers=sorted(prov_list)) for score, prov_list in sorted(score_to_providers.items())
+        HealthScore(
+            code=score,
+            description=HEALTH_SCORE_DESCRIPTION_BY_ENUM.get(HealthScoreCategory(score), ""),
+            providers=sorted(prov_list),
+        )
+        for score, prov_list in sorted(score_to_providers.items())
     ]
 
     return CoverageResponse(
@@ -108,6 +135,7 @@ def _build_coverage() -> CoverageResponse:
         workout_fields=workout_fields,
         sleep_fields=sleep_fields,
         menstrual_cycle_fields=menstrual_cycle_fields,
+        meal_fields=meal_fields,
         health_scores=health_scores,
     )
 
@@ -125,3 +153,28 @@ def _coverage() -> CoverageResponse:
 )
 def get_coverage() -> CoverageResponse:
     return _coverage()
+
+
+def _extension_info(loaded: LoadedExtension) -> ExtensionInfo:
+    ext = loaded.extension
+    return ExtensionInfo(
+        name=loaded.name,
+        display_name=ext.display_name if ext else "",
+        version=ext.version if ext else "",
+        requires_core=ext.requires_core if ext else "",
+        active=loaded.active,
+        error=loaded.error,
+    )
+
+
+@router.get(
+    "/meta/extensions",
+    summary="Installed extensions",
+    tags=["External: Meta"],
+)
+def list_extensions(_api_key: ApiKeyDep) -> ExtensionsResponse:
+    """Every installed extension and whether it loaded; ``error`` says why one did not."""
+    return ExtensionsResponse(
+        core_version=core_version,
+        extensions=[_extension_info(loaded) for loaded in get_extensions()],
+    )

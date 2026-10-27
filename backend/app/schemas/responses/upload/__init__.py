@@ -1,16 +1,20 @@
 from .sync_results import (
     ProviderSyncResult,
+    Sync247Summary,
+    Sync247TaskSummary,
     SyncAllUsersResult,
+    SyncDetails,
+    SyncQueuedResponse,
+    SyncResponse,
     SyncVendorDataResult,
 )
 from .system_info import (
     ConnectionsCoverage,
-    CountWithGrowth,
     DataPointsInfo,
+    EventRecordsInfo,
+    MetricCount,
     ProviderConnectionCount,
-    SeriesTypeMetric,
     SystemInfoResponse,
-    WorkoutTypeMetric,
 )
 from .upload_response import (
     UploadDataResponse,
@@ -21,14 +25,18 @@ __all__ = [
     "SyncVendorDataResult",
     "SyncAllUsersResult",
     "ProviderSyncResult",
+    "Sync247Summary",
+    "Sync247TaskSummary",
+    "SyncDetails",
+    "SyncQueuedResponse",
+    "SyncResponse",
     # Upload response
     "UploadDataResponse",
     # System info
     "ConnectionsCoverage",
-    "CountWithGrowth",
     "DataPointsInfo",
+    "EventRecordsInfo",
+    "MetricCount",
     "ProviderConnectionCount",
     "SystemInfoResponse",
-    "SeriesTypeMetric",
-    "WorkoutTypeMetric",
 ]

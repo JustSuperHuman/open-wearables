@@ -6,11 +6,13 @@ Responsibilities:
 - Register / sync event types on startup
 - Send (emit) webhook messages
 - CRUD proxy for endpoint management
+- Delete message payloads of deleted users
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterator
 from typing import Any
 from uuid import UUID
 
@@ -18,16 +20,19 @@ import httpx
 from jose import jwt
 from svix.api import (
     ApplicationIn,
+    BulkExpungeContentsIn,
+    BulkExpungeStatus,
     EndpointIn,
+    EndpointListOptions,
     EndpointOut,
     EndpointPatch,
     EventTypeIn,
     EventTypeListOptions,
-    EventTypeUpdate,
-    ListResponseEndpointOut,
+    EventTypePatch,
     ListResponseMessageAttemptOut,
     ListResponseMessageOut,
     MessageAttemptListByEndpointOptions,
+    MessageGetOptions,
     MessageIn,
     MessageListOptions,
     MessageOut,
@@ -51,6 +56,23 @@ _SVIX_ORG_ID = "org_openwearables"
 # An endpoint with channels=["user.X"] receives only messages for user X.
 # Svix allows up to 5 channels per message; we always send exactly one.
 _USER_CHANNEL_PREFIX = "user."
+
+# Svix caps message list pages at 250 items.
+_MESSAGE_LIST_PAGE_SIZE = 250
+_PAYLOAD_DELETE_BATCH_SIZE = 100
+
+
+def _walk_pages(fetch_page: Callable[[str | None], Any], listing: str) -> Iterator[Any]:
+    """Every item of a Svix list, fetched page by page from the previous page's iterator."""
+    iterator: str | None = None
+    while True:
+        page = fetch_page(iterator)
+        yield from page.data
+        if page.done or not page.iterator:
+            return
+        if page.iterator == iterator:
+            raise RuntimeError(f"Svix returned the same iterator twice while listing {listing}")
+        iterator = page.iterator
 
 
 def _user_channels(user_id: UUID | None) -> list[str] | None:
@@ -126,15 +148,15 @@ def register_event_types() -> bool:
     # List existing types once (paginated) so a steady-state startup makes a single
     # call instead of a create+update round-trip per type. If Svix is still coming up,
     # skip without crashing app startup — the sync is idempotent and reruns next boot.
-    existing: dict[str, str] = {}
-    iterator: str | None = None
+    client = _client
     try:
-        while True:
-            page = _client.event_type.list(EventTypeListOptions(limit=250, iterator=iterator))
-            existing.update({et.name: et.description for et in page.data})
-            if page.done:
-                break
-            iterator = page.iterator
+        existing = {
+            et.name: et.description
+            for et in _walk_pages(
+                lambda iterator: client.event_type.list(EventTypeListOptions(limit=250, iterator=iterator)),
+                "event types",
+            )
+        }
     except Exception:
         logger.warning("Svix unreachable during startup — skipping event-type sync (reruns next boot).")
         return False
@@ -150,13 +172,13 @@ def register_event_types() -> bool:
             except Exception:
                 # Deemed missing but create failed (archived/race) — update so it is never left unregistered.
                 try:
-                    _client.event_type.update(evt.value, EventTypeUpdate(description=description))
+                    _client.event_type.patch(evt.value, EventTypePatch(description=description))
                 except Exception:
                     logger.exception("Failed to register/update event type %s", evt.value)
                     all_ok = False
         elif current != description:
             try:
-                _client.event_type.update(evt.value, EventTypeUpdate(description=description))
+                _client.event_type.patch(evt.value, EventTypePatch(description=description))
                 logger.info("Updated event type description: %s", evt.value)
             except Exception:
                 logger.exception("Failed to update event type %s", evt.value)
@@ -206,6 +228,7 @@ def send(
                 payload=payload,
                 event_id=idempotency_key,
                 channels=channels or None,
+                payload_retention_period=settings.outgoing_webhook_payload_retention_days,
             ),
         )
     except httpx.ConnectError:
@@ -249,8 +272,8 @@ def create_endpoint(
         "url": url,
         "description": description or "",
     }
-    if filter_types is not None:
-        endpoint_data["filter_types"] = filter_types
+    if filter_types:
+        endpoint_data["event_types"] = filter_types
     channels = _user_channels(user_id)
     if channels is not None:
         endpoint_data["channels"] = channels
@@ -260,9 +283,14 @@ def create_endpoint(
     )
 
 
-def list_endpoints(app_id: str) -> ListResponseEndpointOut:
+def iter_endpoints(app_id: str) -> Iterator[EndpointOut]:
+    """Every endpoint of an application, across Svix's pages."""
     assert _client is not None
-    return _client.endpoint.list(app_id)
+    client = _client
+    return _walk_pages(
+        lambda iterator: client.endpoint.list(app_id, EndpointListOptions(iterator=iterator)),
+        f"endpoints of app {app_id}",
+    )
 
 
 def get_endpoint(app_id: str, endpoint_id: str) -> EndpointOut:
@@ -297,7 +325,11 @@ def patch_endpoint(
     if description is not None:
         patch_data["description"] = description
     if filter_types is not None:
-        patch_data["filter_types"] = filter_types
+        # [] is the public "remove the filter" signal (Svix rejects an empty list,
+        # so it goes out as an explicit null).  None stays a no-op: it is what an
+        # omitted field deserialises to and external clients already rely on that,
+        # so it must not be repurposed into a second clearing signal.
+        patch_data["event_types"] = filter_types or None
     if user_id is not None:
         patch_data["channels"] = _user_channels(user_id)
     elif clear_user_id:
@@ -325,7 +357,7 @@ def get_endpoint_secret(app_id: str, endpoint_id: str) -> str:
 def get_message(app_id: str, msg_id: str) -> MessageOut | None:
     assert _client is not None
     try:
-        return _client.message.get(app_id, msg_id)
+        return _client.message.get(app_id, msg_id, MessageGetOptions(with_content=True))
     except Exception:
         logger.debug("Could not fetch message %s for app %s", msg_id, app_id)
         return None
@@ -337,6 +369,52 @@ def list_messages(
 ) -> ListResponseMessageOut:
     assert _client is not None
     return _client.message.list(app_id, options or MessageListOptions())
+
+
+def delete_user_message_payloads(app_id: str, user_id: UUID) -> int:
+    """Delete the payloads of every message sent on a user's channel in one application.
+
+    The message records themselves stay in Svix (there is no API to delete them), but
+    without the payload they can no longer be read, replayed or retried. Messages older
+    than Svix's 90-day payload retention are not listed and already have no payload.
+
+    Returns:
+        Number of messages whose payload was deleted.
+
+    Raises:
+        Any Svix/HTTP error, so the caller can retry.
+    """
+    if not is_enabled():
+        return 0
+    assert _client is not None
+    channel = f"{_USER_CHANNEL_PREFIX}{user_id}"
+
+    client = _client
+    msg_ids = [
+        msg.id
+        for msg in _walk_pages(
+            lambda iterator: client.message.list(
+                app_id, MessageListOptions(limit=_MESSAGE_LIST_PAGE_SIZE, iterator=iterator, channel=channel)
+            ),
+            f"messages of app {app_id}",
+        )
+    ]
+
+    deleted = 0
+    for start in range(0, len(msg_ids), _PAYLOAD_DELETE_BATCH_SIZE):
+        batch = msg_ids[start : start + _PAYLOAD_DELETE_BATCH_SIZE]
+        try:
+            result = _client.message.bulk_expunge_content(app_id, BulkExpungeContentsIn(ids=batch))
+        except HttpError as exc:
+            # bulk-expunge only exists on svix-server >= 1.101.0; delete one by one on older servers.
+            if exc.status_code not in (404, 405):
+                raise
+            for msg_id in batch:
+                _client.message.expunge_content(app_id, msg_id)
+            deleted += len(batch)
+            continue
+        deleted += sum(1 for status in result.results.values() if status == BulkExpungeStatus.EXPUNGED)
+    return deleted
 
 
 def list_message_attempts(
@@ -355,21 +433,22 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
 
     Uses ``message.create`` with an example payload instead of
     ``endpoint.send_example`` which requires Svix event-type schemas to be defined.
-    The event_type is adjusted to match the endpoint's filter_types if set.
+    The event_type is adjusted to match the endpoint's filters if set.
     """
     if not is_enabled():
         return None
     assert _client is not None
     try:
         ep = _client.endpoint.get(app_id, endpoint_id)
-        if ep.filter_types and event_type not in ep.filter_types:
-            event_type = ep.filter_types[0]
+        if ep.event_types and event_type not in ep.event_types:
+            event_type = ep.event_types[0]
         return _client.message.create(
             app_id,
             MessageIn(
                 event_type=event_type,
                 payload=get_test_payload(event_type),
                 event_id=f"test.{endpoint_id}.{event_type}",
+                payload_retention_period=settings.outgoing_webhook_payload_retention_days,
             ),
         )
     except Exception:

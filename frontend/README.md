@@ -1,239 +1,64 @@
-# Open Wearables Platform - Frontend
+# Open Wearables - Developer Portal
 
-Modern web application built with TanStack Start for the Open Wearables Platform - a unified API for health data aggregation and automation.
+The admin dashboard for an Open Wearables deployment: users and their data,
+syncs, webhooks, data coverage, and instance settings. Built with SvelteKit 2
+(Svelte 5), Tailwind CSS v4 and Bun, rendered on the server.
 
-## Tech Stack
+The browser never talks to the API directly. It keeps the API tokens in an
+`HttpOnly` cookie that page scripts cannot read, and the SvelteKit server calls
+the backend on its behalf. The portal itself is stateless.
 
-- **Framework**: TanStack Start (React 19)
-- **Language**: TypeScript 5.7
-- **Styling**: Tailwind CSS 4.0
-- **UI Components**: shadcn/ui
-- **Data Fetching**: TanStack Query
-- **Form Management**: React Hook Form + Zod
-- **Charts**: Recharts
-- **Icons**: Lucide React
+## Requirements
 
-## Features
+- [Bun](https://bun.sh) 1.4+
+- A running Open Wearables backend
 
-- File-based routing with TanStack Router
-- Server-side rendering (SSR) support
-- Type-safe API integration
-- Dark mode support
-- Responsive design
-- Component library with shadcn/ui
-- Form validation with Zod
-- Toast notifications with Sonner
+## Configuration
 
-## Project Structure
+Copy the example and adjust it:
 
-```
-src/
-├── components/
-│   ├── ui/              # shadcn/ui components
-│   ├── layout/          # Layout components (Sidebar, etc.)
-│   └── features/        # Feature-specific components
-├── routes/
-│   ├── __root.tsx       # Root layout with providers
-│   ├── index.tsx        # Home (redirects to /login)
-│   ├── login.tsx        # Login page
-│   └── _authenticated/  # Protected routes
-│       ├── dashboard.tsx
-│       └── users.tsx
-├── lib/
-│   └── utils.ts         # Utility functions
-├── hooks/               # Custom React hooks
-└── styles.css           # Global styles and design tokens
-```
-
-## Getting Started
-
-### Prerequisites
-
-- Node.js 18+
-- npm or pnpm
-
-### Installation
-
-1. Clone the repository
-2. Install dependencies:
-
-```bash
-npm install
-```
-
-3. Copy environment variables:
-
-```bash
+```sh
 cp .env.example .env
 ```
 
-4. Start the development server:
+| Variable       | Required | Purpose                                                                                                     |
+| -------------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `VITE_API_URL` | yes      | Public URL of the API, as a browser or phone reaches it. Also used by the server when `API_URL` is not set. |
+| `API_URL`      | no       | A shorter route from the portal's server to the API, e.g. `http://app:8000` inside Docker.                  |
 
-```bash
-npm run dev
+Both are read at runtime, so one image works against any backend without a
+rebuild.
+
+## Development
+
+```sh
+bun install
+bun run dev            # http://localhost:3000
 ```
 
-The app will be available at http://localhost:3000
+With Docker, `docker compose watch` from the repository root runs the portal
+together with the backend, with hot reload.
 
-## Available Scripts
+## Checks
 
-- `npm run dev` - Start development server on port 3000
-- `npm run build` - Build for production
-- `npm run serve` - Preview production build
-- `npm test` - Run tests with Vitest
-
-## Environment Variables
-
-Create a `.env` file based on `.env.example`:
-
-```bash
-VITE_API_URL=http://localhost:8000  # Backend API URL
+```sh
+bun run check          # svelte-check (types)
+bun run lint           # eslint
+bun run format         # prettier --write
+bun run test:unit      # vitest: unit tests and component tests in Chromium
+bun run test:e2e       # playwright against a production build and a mock API
 ```
 
-## Design System
+`make frontend_verify` from the repository root runs everything CI runs.
 
-### Colors
+## Production
 
-The application uses a custom color palette defined in `src/styles.css`:
-
-- **Primary**: Blue (#3B82F6) - Main brand color
-- **Secondary**: Teal (#14B8A6) - Accent color
-- **Success**: Green - Success states
-- **Warning**: Orange - Warning states
-- **Destructive**: Red - Error states
-
-### Dark Mode
-
-Dark mode is enabled by default using the `dark` class on the root HTML element.
-
-## Routing
-
-TanStack Start uses file-based routing:
-
-- `/` - Redirects to `/login`
-- `/login` - Authentication page
-- `/_authenticated/*` - Protected routes (requires authentication)
-  - `/dashboard` - Main dashboard
-  - `/users` - User management
-  - `/health-insights` - Health automations
-  - `/credentials` - API credentials
-
-## Components
-
-### UI Components (shadcn/ui)
-
-Installed components:
-
-- Button
-- Card
-- Input
-- Label
-- Form
-- Select
-- Textarea
-- Badge
-- Avatar
-- Separator
-- Sonner (Toast)
-- Table
-- Dropdown Menu
-- Dialog
-- Sheet
-- Sidebar
-
-To add more components:
-
-```bash
-npx shadcn@latest add [component-name]
+```sh
+bun run build
+bun ./build/index.js   # listens on PORT (default 3000)
 ```
 
-### Layout Components
+The published image is `themomentum/open-wearables-frontend`. See the
+[Docker deployment guide](https://openwearables.io/docs/deployment/docker).
 
-- **AppSidebar**: Main navigation sidebar
-- **AuthenticatedLayout**: Layout wrapper for protected routes
-
-## State Management
-
-- **TanStack Query**: Server state management and caching
-- **React Context**: For global UI state (theme, sidebar)
-- **React Hook Form**: Form state management
-
-## API Integration
-
-API calls should be made using TanStack Query for optimal caching and state management:
-
-```typescript
-import { useQuery } from '@tanstack/react-query';
-
-function useUsers() {
-  return useQuery({
-    queryKey: ['users'],
-    queryFn: async () => {
-      const response = await fetch(`${import.meta.env.VITE_API_URL}/users`);
-      return response.json();
-    },
-  });
-}
-```
-
-## Authentication
-
-Authentication is scaffolded but needs to be connected to the backend:
-
-1. Update `/src/routes/login.tsx` to call the actual auth API
-2. Implement session management
-3. Add route protection in `/_authenticated` layout
-
-## Testing
-
-Tests are set up with Vitest and React Testing Library:
-
-```bash
-npm test
-```
-
-## Building for Production
-
-```bash
-npm run build
-```
-
-This creates an optimized production build in the `dist/` directory.
-
-## Deployment
-
-The application can be deployed to:
-
-- Vercel
-- Netlify
-- Cloudflare Pages
-- Any Node.js hosting platform
-
-Set the build command to `npm run build` and the output directory to `dist`.
-
-## Contributing
-
-1. Create a feature branch
-2. Make your changes
-3. Write/update tests
-4. Submit a pull request
-
-## Code Style
-
-- Use TypeScript strict mode
-- Follow ESLint rules
-- Use Prettier for formatting
-- Components should be functional with hooks
-- Prefer composition over inheritance
-
-## Resources
-
-- [TanStack Start Documentation](https://tanstack.com/start)
-- [TanStack Router Documentation](https://tanstack.com/router)
-- [TanStack Query Documentation](https://tanstack.com/query)
-- [shadcn/ui Documentation](https://ui.shadcn.com)
-- [Tailwind CSS Documentation](https://tailwindcss.com)
-
-## License
-
-See LICENSE file in the root directory.
+Conventions for contributors and coding agents are in [AGENTS.md](AGENTS.md).

@@ -9,6 +9,7 @@ Tests cover:
 """
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -424,3 +425,111 @@ class TestUserConnectionServiceConnectionStatus:
         # Assert
         assert updated2 is not None
         assert updated2.status == ConnectionStatus.ACTIVE
+
+
+class TestEnsureSdkConnection:
+    """Test SDK connection creation and its connection.created emission."""
+
+    def test_creates_connection_and_emits(self, db: Session) -> None:
+        """First upload for a user should create the connection and emit."""
+        user = UserFactory()
+
+        with patch("app.services.user_connection_service.on_connection_created") as emit:
+            connection = user_connection_service.ensure_sdk_connection(db, user.id, "apple")
+
+        assert connection.provider == "apple"
+        assert connection.status == ConnectionStatus.ACTIVE
+        assert connection.access_token is None
+        emit.assert_called_once()
+        kwargs = emit.call_args.kwargs
+        assert kwargs["provider"] == "apple"
+        assert kwargs["user_id"] == user.id
+        assert kwargs["connection_id"] == connection.id
+        # connected_at must come from the row, not now(): it feeds the idempotency key
+        assert kwargs["connected_at"] == connection.created_at.isoformat()
+
+    def test_existing_active_connection_does_not_emit(self, db: Session) -> None:
+        """Subsequent batches must stay silent -- this runs on every upload."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="apple", status=ConnectionStatus.ACTIVE)
+
+        with patch("app.services.user_connection_service.on_connection_created") as emit:
+            user_connection_service.ensure_sdk_connection(db, user.id, "apple")
+
+        emit.assert_not_called()
+
+    def test_reactivates_revoked_connection_and_emits(self, db: Session) -> None:
+        """A revoked connection coming back is a state change worth relaying."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="apple", status=ConnectionStatus.REVOKED)
+
+        with patch("app.services.user_connection_service.on_connection_created") as emit:
+            connection = user_connection_service.ensure_sdk_connection(db, user.id, "apple")
+
+        assert connection.status == ConnectionStatus.ACTIVE
+        emit.assert_called_once()
+        # updated_at, so the idempotency key differs from the original creation
+        assert emit.call_args.kwargs["connected_at"] == connection.updated_at.isoformat()
+
+    def test_repeated_calls_emit_once_with_stable_key(self, db: Session) -> None:
+        """Retries of the Celery task must not produce a second event."""
+        user = UserFactory()
+
+        with patch("app.services.user_connection_service.on_connection_created") as emit:
+            first = user_connection_service.ensure_sdk_connection(db, user.id, "apple")
+            for _ in range(3):
+                user_connection_service.ensure_sdk_connection(db, user.id, "apple")
+
+        assert emit.call_count == 1
+        assert emit.call_args.kwargs["connected_at"] == first.created_at.isoformat()
+
+
+class TestUserConnectionServiceDeregisterFromProvider:
+    """Deregistration must use a valid token, refreshing a stale one first."""
+
+    def test_refreshes_expired_token_before_deregistering(self, db: Session) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="stale",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(days=30),
+        )
+        oauth = MagicMock()
+        oauth.refresh_access_token.return_value.access_token = "fresh"
+
+        user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
+
+        oauth.refresh_access_token.assert_called_once_with(
+            db, user.id, connection.refresh_token, revoke_on_failure=True
+        )
+        oauth.deregister_user.assert_called_once_with("fresh", provider_user_id=connection.provider_user_id)
+
+    def test_uses_stored_token_when_still_valid(self, db: Session) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="valid",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        oauth = MagicMock()
+
+        user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
+
+        oauth.refresh_access_token.assert_not_called()
+        oauth.deregister_user.assert_called_once_with("valid", provider_user_id=connection.provider_user_id)
+
+    def test_refresh_failure_skips_deregistration_without_raising(self, db: Session) -> None:
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(days=30),
+        )
+        oauth = MagicMock()
+        oauth.refresh_access_token.side_effect = RuntimeError("refresh rejected")
+
+        user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
+
+        oauth.deregister_user.assert_not_called()

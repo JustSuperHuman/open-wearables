@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e -x
 
+scripts/start/install_extensions.sh
+
 # Ensure svix database exists (idempotent)
 echo 'Ensuring svix database...'
 uv run python scripts/init/create_svix_db.py
@@ -9,13 +11,22 @@ uv run python scripts/init/create_svix_db.py
 echo 'Applying migrations...'
 uv run alembic upgrade head
 
+# TODO: Remove this after ~2026-11-01 once all deployments have migrated.
+# Splits the legacy 'google' provider into 'health_connect' (SDK) and 'google_health'
+# (cloud OAuth). Must stay ahead of init_provider_settings.py, which seeds a google_health
+# row that the rename would collide with. Idempotent, no-op once split.
+echo 'Running google provider split...'
+uv run python scripts/data_migrations/split_google_provider.py \
+    || echo "Warning: google provider split failed — will retry on next startup."
+
 # Initialize provider settings
 echo 'Initializing provider settings...'
 uv run python scripts/init_provider_settings.py
 
-# Initialize device priority table
+# Initialize priority tables
 echo 'Initializing priorities...'
 uv run python scripts/init_device_priorities.py
+uv run python scripts/init_provider_priorities.py
 
 # Seed admin account (uses ADMIN_EMAIL/ADMIN_PASSWORD env vars, or defaults)
 echo 'Seeding admin account...'
@@ -25,42 +36,75 @@ uv run python scripts/init/seed_admin.py
 echo 'Initializing series type definitions...'
 uv run python scripts/init/seed_series_types.py
 
-# TODO: Remove this after ~2026-06-01 once all deployments have migrated.
-# Drops legacy recovery_score timeseries data; no-op if already cleaned up.
-echo 'Running recovery_score series type cleanup...'
-uv run python scripts/data_migrations/drop_recovery_score_series_type.py \
-    || echo "Warning: recovery_score cleanup failed — will retry on next startup."
 
-# TODO: Remove this after ~2026-06-01 once all deployments have migrated.
-# Divides body_fat_percentage values stored 100x too large (Samsung/Google bug, PR #917); no-op if already corrected.
-echo 'Running body_fat_percentage normalization...'
-uv run python scripts/data_migrations/normalize_body_fat_percentage.py \
-    || echo "Warning: body_fat_percentage normalization failed — will retry on next startup."
+# TODO: Remove this after ~2026-11-01 once all deployments have migrated.
+# Relabels Ultrahuman temperature stored as body_temperature (id=45) to skin_temperature
+# (id=46); scoped to provider='ultrahuman', no-op once corrected.
+echo 'Running Ultrahuman body_temperature->skin_temperature relabel...'
+uv run python scripts/data_migrations/relabel_ultrahuman_body_temp_to_skin_temp.py \
+    || echo "Warning: Ultrahuman temperature relabel failed — will retry on next startup."
 
-# TODO: Remove this after ~2026-09-01 once all deployments have migrated.
-# Relabels Oura HRV stored as SDNN (id=3) to RMSSD (id=7); scoped to provider='oura', no-op once corrected.
-echo 'Running Oura HRV SDNN->RMSSD relabel...'
-uv run python scripts/data_migrations/relabel_oura_hrv_sdnn_to_rmssd.py \
-    || echo "Warning: Oura HRV relabel failed — will retry on next startup."
 
-# TODO: Remove this after ~2026-08-01 once all deployments have migrated.
-# Nulls workout heart_rate_min values copied from average HR (Garmin pre-#1121, Polar pre-#1041); no-op once cleaned.
-echo 'Running workout heart_rate_min cleanup...'
-uv run python scripts/data_migrations/null_bogus_workout_heart_rate_min.py \
-    || echo "Warning: workout heart_rate_min cleanup failed - will retry on next startup."
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Relabels Ultrahuman HRV stored as SDNN (id=3) to RMSSD (id=7); the ring measures
+# RMSSD. Scoped to provider='ultrahuman', no-op once corrected.
+echo 'Running Ultrahuman HRV SDNN->RMSSD relabel...'
+uv run python scripts/data_migrations/relabel_ultrahuman_hrv_sdnn_to_rmssd.py \
+    || echo "Warning: Ultrahuman HRV relabel failed — will retry on next startup."
 
-# TODO: Remove this after ~2026-08-01 once all deployments have migrated.
-# Multiplies Apple HealthKit walking metrics stored as fractions/meters (issues #1105, #1106); no-op if already corrected.
-echo 'Running Apple walking metrics normalization...'
-uv run python scripts/data_migrations/normalize_apple_walking_metrics.py \
-    || echo "Warning: Apple walking metrics normalization failed — will retry on next startup."
 
-# TODO: Remove this after ~2026-09-01 once all deployments have migrated.
-# Labels is_daily_total on archival data_point_series (daily totals → TRUE); idempotent,
-# only flips NULL rows, batched. After the first full pass, re-runs are no-ops.
-echo 'Running is_daily_total backfill...'
-uv run python scripts/data_migrations/backfill_is_daily_total.py \
-    || echo "Warning: is_daily_total backfill failed — will retry on next startup."
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Relabels Ultrahuman active minutes stored as active_time (id=88) to exercise_time
+# (id=84). Scoped to provider='ultrahuman', no-op once corrected.
+echo 'Running Ultrahuman active_time->exercise_time relabel...'
+uv run python scripts/data_migrations/relabel_ultrahuman_active_time_to_exercise_time.py \
+    || echo "Warning: Ultrahuman active time relabel failed — will retry on next startup."
+
+
+# TODO: Remove this after ~2026-12-01 once all deployments have migrated.
+# Links legacy Whoop workout strain scores to their event records; without it they stay
+# indistinguishable from the per-day cycle strain. Idempotent, no-op once linked.
+echo 'Running Whoop strain event_record backfill...'
+uv run python scripts/data_migrations/backfill_whoop_strain_event_record.py \
+    || echo "Warning: Whoop strain backfill failed — will retry on next startup."
+
+
+# TODO: Remove this after ~2026-11-01 once all deployments have migrated.
+# Moves Whoop whole-day strain and energy off the cycle's start onto the day the cycle
+# covers. Must stay after the strain backfill above, which is what tells cycle strain
+# apart from legacy workout strain. Idempotent, no-op once re-keyed.
+echo 'Running Whoop cycle day re-key...'
+uv run python scripts/data_migrations/rekey_whoop_cycle_days.py \
+    || echo "Warning: Whoop cycle re-key failed — will retry on next startup."
+
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Relabels Whoop cycle energy stored as active_energy to total_energy: it includes BMR.
+# Drops 0 kJ no-wear rows. Runs once per instance (data_migration).
+echo 'Running Whoop active_energy->total_energy relabel...'
+uv run python scripts/data_migrations/relabel_whoop_active_energy_to_total_energy.py \
+    || echo "Warning: Whoop energy relabel failed — will retry on next startup."
+
+# TODO: Remove this after ~2026-12-01 once all deployments have migrated.
+# Re-resolves data_source.device_type with the new mappings: cloud-provider rows are
+# recomputed, SDK-provider rows only upgrade NULL/'other'. Idempotent; live sync applies
+# the same rule afterwards.
+echo 'Running device type backfill...'
+uv run python scripts/data_migrations/backfill_device_types.py \
+    || echo "Warning: device type backfill failed — will retry on next startup."
+
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Merges data sources split by placeholder models / platform names / Polar's missing source,
+# then drops events duplicated across a user's sources. Idempotent, no-op once merged.
+echo 'Running data source merge...'
+uv run python scripts/data_migrations/merge_duplicate_data_sources.py \
+    || echo "Warning: data source merge failed — will retry on next startup."
+
+# TODO: Remove this after ~2027-03-01 once all deployments have migrated.
+# Clears the 0 kcal the SDK and Apple XML importers stored for workouts that reported no
+# calories. Runs once per instance (data_migration).
+echo 'Running SDK workout calories cleanup...'
+uv run python scripts/data_migrations/clear_sdk_zero_workout_calories.py \
+    || echo "Warning: SDK workout calories cleanup failed — will retry on next startup."
 
 # Initialize archival settings
 echo 'Initializing archival settings...'
@@ -77,7 +121,7 @@ done || echo "Warning: Could not register webhook event types with Svix. Will re
 # Init app
 echo "Starting the FastAPI application..."
 if [ "$ENVIRONMENT" = "local" ]; then
-    uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    exec uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
 else
-    uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    exec uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
 fi

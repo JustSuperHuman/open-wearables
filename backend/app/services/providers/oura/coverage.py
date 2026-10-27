@@ -4,9 +4,12 @@ from app.schemas.enums.health_score_category import HealthScoreCategory
 # Timeseries mappings (handler key → SeriesType) consumed directly by data_247.py.
 ACTIVITY_SERIES: dict[str, SeriesType] = {
     "steps": SeriesType.steps,
-    "energy": SeriesType.energy,
+    "energy": SeriesType.active_energy,
+    "basal_energy": SeriesType.basal_energy,
     "distance": SeriesType.distance_walking_running,
     "active_time": SeriesType.active_time,
+    "exercise_time": SeriesType.exercise_time,
+    "met": SeriesType.physical_effort,
 }
 READINESS_SERIES: dict[str, SeriesType] = {
     "temperature_deviation": SeriesType.skin_temperature_deviation,
@@ -45,6 +48,9 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "energy_burned",
         "distance",
         "moving_time_seconds",
+        "entry_source",
+        "intensity",
+        "label",
     }
 )
 

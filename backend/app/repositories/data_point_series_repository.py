@@ -1,23 +1,65 @@
-import contextlib
-from datetime import datetime, time, timedelta
+from collections.abc import Iterable
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from typing import LiteralString, NamedTuple, overload
+from typing import cast as typing_cast
 from uuid import UUID
 
+from psycopg import Connection as PGConnection
 from psycopg.errors import UniqueViolation
-from sqlalchemy import ColumnElement, Date, Interval, String, and_, asc, case, cast, func, literal_column, text, tuple_
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import (
+    Column,
+    ColumnElement,
+    Date,
+    Integer,
+    Interval,
+    MetaData,
+    String,
+    Table,
+    and_,
+    asc,
+    case,
+    cast,
+    column,
+    func,
+    literal,
+    literal_column,
+    select,
+    text,
+    true,
+    tuple_,
+    values,
+)
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
+from sqlalchemy.orm import Query
+from sqlalchemy.schema import CreateTable
 
 from app.database import DbSession
-from app.models import DataPointSeries, DataSource, DeviceTypePriority, ProviderPriority
+from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, DeviceTypePriority, ProviderPriority
 from app.models.series_type_definition import SeriesTypeDefinition
-from app.repositories.data_source_repository import DataSourceRepository
-from app.repositories.repositories import CrudRepository
+from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSourceIdentity, DataSourceRepository
+from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+from app.repositories.repositories import (
+    CrudRepository,
+    source_filter_conditions,
+    timeline_key_column,
+    utc_bucket_start,
+)
+from app.schemas.data_type_coverage import CoverageSpan
 from app.schemas.enums import (
+    BUCKET_SIZES,
+    AggregationMethod,
     ProviderName,
+    Resolution,
     SeriesType,
+    TimelineBucket,
+    TimelineGroupBy,
     get_series_type_from_id,
     get_series_type_id,
 )
+from app.schemas.enums.aggregation_method import get_aggregation_method
 from app.schemas.model_crud.activities import (
     TimeSeriesQueryParams,
     TimeSeriesSampleCreate,
@@ -28,11 +70,55 @@ from app.schemas.responses.activity import (
     ActivityAggregateResult,
     IntensityMinutesResult,
 )
+from app.schemas.sync_status import DataTypeKind
+from app.utils.dates import as_utc
 from app.utils.exceptions import handle_exceptions
-from app.utils.pagination import decode_cursor
+from app.utils.pagination import decode_bucket_cursor, decode_cursor
 
-# Identity tuple: (user_id, device_model, source)
-DataSourceIdentity = tuple[UUID, str | None, str | None]
+
+class TypeCounts(NamedTuple):
+    """One series type's share of a bulk upsert."""
+
+    inserted: int
+    updated: int
+    covered_start: datetime
+    covered_end: datetime
+
+    def merged_with(self, other: "TypeCounts") -> "TypeCounts":
+        return TypeCounts(
+            self.inserted + other.inserted,
+            self.updated + other.updated,
+            min(self.covered_start, other.covered_start),
+            max(self.covered_end, other.covered_end),
+        )
+
+
+class _StagedSpan(NamedTuple):
+    """The rows staged for one data source and series type: how many, and the span they cover."""
+
+    staged: int
+    start: datetime
+    end: datetime
+
+
+def _spans_by_source_and_type(
+    rows: Iterable["DataPointSeriesRepository._StagingRow"],
+) -> dict[tuple[UUID, int], _StagedSpan]:
+    """One pass over the rows already in memory, so neither the counts nor coverage cost a query."""
+    # Updated in place: a sample batch runs to millions of rows, and few keys.
+    spans: dict[tuple[UUID, int], list] = {}
+    for row in rows:
+        at = row.recorded_at
+        span = spans.get((row.data_source_id, row.series_type_definition_id))
+        if span is None:
+            spans[(row.data_source_id, row.series_type_definition_id)] = [1, at, at]
+            continue
+        span[0] += 1
+        if at < span[1]:
+            span[1] = at
+        elif at > span[2]:
+            span[2] = at
+    return {key: _StagedSpan(*span) for key, span in spans.items()}
 
 
 class WriteCounts(int):
@@ -44,28 +130,112 @@ class WriteCounts(int):
     ``.inserted`` (rows that did not exist) and ``.updated`` (rows refreshed
     in place via ON CONFLICT). Distinguishing the two is what stops a pure
     upsert-in-place from looking like newly arrived data.
+
+    covered_start/covered_end are the oldest and newest ``recorded_at`` actually
+    written. This is the span of the data itself, which is not the window that was
+    requested: asking for 90 days and getting two weight readings covers two days.
+
+    The totals are stored rather than summed from by_type: some write paths report a
+    split without a per-type breakdown.
     """
 
     inserted: int
     updated: int
+    # Keyed by canonical SeriesType slug, so run tracking can report per type rather
+    # than per provider fetch task.
+    by_type: dict[str, TypeCounts]
 
-    def __new__(cls, inserted: int, updated: int) -> "WriteCounts":
+    def __new__(cls, inserted: int, updated: int, by_type: dict[str, TypeCounts] | None = None) -> "WriteCounts":
         obj = super().__new__(cls, inserted + updated)
         obj.inserted = inserted
         obj.updated = updated
+        obj.by_type = by_type or {}
         return obj
+
+    @property
+    def covered_start(self) -> datetime | None:
+        return min((counts.covered_start for counts in self.by_type.values()), default=None)
+
+    @property
+    def covered_end(self) -> datetime | None:
+        return max((counts.covered_end for counts in self.by_type.values()), default=None)
+
+    # Overloads are for the type checker: they tell it which addition keeps the split.
+    @overload
+    def __add__(self, other: "WriteCounts") -> "WriteCounts": ...
+
+    @overload
+    def __add__(self, other: int) -> int: ...
+
+    def __add__(self, other: int) -> int:
+        """Keep the split and widen the covered span when accumulating counts.
+
+        A plain int has no split to keep, so adding one yields a plain int.
+        """
+        if not isinstance(other, WriteCounts):
+            return int(self) + other
+        by_type = dict(self.by_type)
+        for series_type, counts in other.by_type.items():
+            existing = by_type.get(series_type)
+            by_type[series_type] = counts if existing is None else existing.merged_with(counts)
+        return WriteCounts(self.inserted + other.inserted, self.updated + other.updated, by_type)
+
+    def __radd__(self, other: int) -> int:
+        # Makes sum() of WriteCounts work: the 0 start value passes the split through.
+        if other == 0:
+            return self
+        return other + int(self)
+
+    def __repr__(self) -> str:
+        return f"WriteCounts(inserted={self.inserted}, updated={self.updated})"
+
+
+# Sources whose provider or device type is not ranked sort last, in id order.
+_UNRANKED = 1_000_000
+SERIES_TYPE_IDS: tuple[int, ...] = tuple(get_series_type_id(t) for t in SeriesType)
+_AGGREGATE_FUNCS = {
+    AggregationMethod.AVG: func.avg,
+    AggregationMethod.SUM: func.sum,
+    AggregationMethod.MAX: func.max,
+}
+# Series type ids per non-default aggregation, resolved once: the mapping is static and the
+# lookup would otherwise run per request. AVG is the else branch, so it needs no entry.
+_TYPE_IDS_BY_METHOD: dict[AggregationMethod, frozenset[int]] = {
+    method: frozenset(get_series_type_id(t) for t in SeriesType if get_aggregation_method(t) is method)
+    for method in _AGGREGATE_FUNCS
+    if method is not AggregationMethod.AVG
+}
+
+
+# Rows per avg HR query; 5 bind parameters each keeps a query far below PostgreSQL's 65535
+_MAX_WINDOW_ROWS = 2000
+
+
+class WorkoutWindow(NamedTuple):
+    """A workout's time window, its own data source and the sources to fall back on for samples."""
+
+    record_id: UUID
+    data_source_id: UUID
+    start_time: datetime
+    end_time: datetime
+    fallback_source_ids: tuple[UUID, ...] = ()
+
+
+class AggregatedSample(NamedTuple):
+    """One resolution bucket for a single (data source, series type) pair."""
+
+    bucket: datetime
+    series_type_definition_id: int
+    value: Decimal
+    zone_offset: str | None
+    is_daily_total: bool
+    data_source: DataSource
 
 
 class DataPointSeriesRepository(
     CrudRepository[DataPointSeries, TimeSeriesSampleCreate, TimeSeriesSampleUpdate],
 ):
     """Repository for unified device data point series."""
-
-    # PostgreSQL/psycopg cap of 65535 bind params per query. Derive the row chunk
-    # from the column count in _insert_data_points so adding a column can't silently
-    # push a full chunk over the limit (8 cols -> 8191 rows).
-    _INSERT_COLUMNS_PER_ROW = 8
-    BATCH_INSERT_CHUNK_SIZE = 65_535 // _INSERT_COLUMNS_PER_ROW
 
     def __init__(self, model: type[DataPointSeries]):
         super().__init__(model)
@@ -78,22 +248,9 @@ class DataPointSeriesRepository(
         Handles duplicate records gracefully by catching IntegrityError and
         returning the existing record instead.
         """
-        data_source = self.create_data_source(db_session, creator)
+        data_source = self.data_source_repo.ensure_for_creator(db_session, creator)
 
-        creation_data = creator.model_dump()
-
-        # Remove schema-only fields before creating the model
-        for redundant_key in (
-            "user_id",
-            "source",
-            "device_model",
-            "provider",
-            "user_connection_id",
-            "software_version",
-            "series_type",
-            "data_source_id",
-        ):
-            creation_data.pop(redundant_key, None)
+        creation_data = creator.model_dump(exclude={*DATA_SOURCE_FIELDS, "series_type", "data_source_id"})
 
         # Set the proper values
         creation_data["data_source_id"] = data_source.id
@@ -118,109 +275,157 @@ class DataPointSeriesRepository(
             return WriteCounts(0, 0)
 
         # 1. Resolve all data sources in batch
-        identity_to_source_id = self._resolve_data_sources(db_session, creators)
+        identity_to_source_id = self.data_source_repo.resolve_creators(db_session, creators)
 
         # 2. Build and execute data point batch insert
-        return self._insert_data_points(db_session, creators, identity_to_source_id)
+        rows, owners = self._staging_rows(creators, identity_to_source_id)
+        if not rows:
+            return WriteCounts(0, 0)
+        spans = _spans_by_source_and_type(rows)
+        counts = self._insert_data_points(db_session, rows, spans)
 
-    def _resolve_data_sources(
-        self, db_session: DbSession, creators: list[TimeSeriesSampleCreate]
-    ) -> dict[DataSourceIdentity, UUID]:
-        by_provider: dict[ProviderName, list[TimeSeriesSampleCreate]] = {}
-        for c in creators:
-            provider = self.data_source_repo.infer_provider_from_source(c.source)
-            if c.provider:
-                with contextlib.suppress(ValueError):
-                    provider = ProviderName(c.provider)
-            by_provider.setdefault(provider, []).append(c)
+        # 3. Widen what we hold per type, under the same provider the sources resolved to
+        data_type_coverage_repository.record(
+            db_session,
+            (
+                CoverageSpan(
+                    user_id=owners[source_id][0],
+                    provider=owners[source_id][1],
+                    data_type=get_series_type_from_id(type_id).value,
+                    kind=DataTypeKind.SERIES,
+                    start=span.start,
+                    end=span.end,
+                )
+                for (source_id, type_id), span in spans.items()
+            ),
+        )
+        return counts
 
-        identity_to_source_id: dict[DataSourceIdentity, UUID] = {}
+    class _StagingRow(NamedTuple):
+        """One row as loaded into data_point_series_staging via COPY, in column order."""
 
-        for provider, provider_creators in by_provider.items():
-            unique_identities: set[DataSourceIdentity] = set()
-            user_connection_id = provider_creators[0].user_connection_id if provider_creators else None
-            for c in provider_creators:
-                unique_identities.add((c.user_id, c.device_model, c.source))
+        id: UUID
+        external_id: str | None
+        data_source_id: UUID
+        recorded_at: datetime
+        zone_offset: str | None
+        value: Decimal | float | int
+        series_type_definition_id: int
+        is_daily_total: bool | None
 
-            batch_result = self.data_source_repo.batch_ensure_data_sources(
-                db_session, provider, user_connection_id, unique_identities
+    # Single source of truth for the COPY/INSERT column list, derived from _StagingRow's
+    # own field names above so the SQL text and the row shape can't drift apart.
+    _COPY_COLUMNS_SQL = typing_cast(LiteralString, ", ".join(_StagingRow._fields))  # ty:ignore[redundant-cast]
+
+    def _staging_rows(
+        self, creators: list[TimeSeriesSampleCreate], source_map: dict[DataSourceIdentity, UUID]
+    ) -> tuple[list["DataPointSeriesRepository._StagingRow"], dict[UUID, tuple[UUID, str]]]:
+        """The rows to merge, one per key, and the user and provider each data source belongs to."""
+        rows: list[DataPointSeriesRepository._StagingRow] = []
+        owners: dict[UUID, tuple[UUID, str]] = {}
+        for creator in creators:
+            source_id = source_map.get(DataSourceIdentity.of(creator))
+            if not source_id:
+                # Should not happen if resolve logic is correct, but safe skip.
+                continue
+            if source_id not in owners:
+                owners[source_id] = (creator.user_id, self.data_source_repo.provider_of(creator).value)
+            rows.append(
+                self._StagingRow(
+                    id=creator.id,
+                    external_id=creator.external_id,
+                    data_source_id=source_id,
+                    recorded_at=creator.recorded_at,
+                    zone_offset=creator.zone_offset,
+                    value=creator.value,
+                    series_type_definition_id=get_series_type_id(creator.series_type),
+                    is_daily_total=creator.is_daily_total,
+                )
             )
-            identity_to_source_id.update(batch_result)
 
-        return identity_to_source_id
+        # Dedup within the batch: PostgreSQL cannot upsert the same row twice in one
+        # statement. Keep the last value for each conflicting key.
+        deduped: dict[tuple[UUID, int, datetime], DataPointSeriesRepository._StagingRow] = {}
+        for row in rows:
+            deduped[(row.data_source_id, row.series_type_definition_id, row.recorded_at)] = row
+        return list(deduped.values()), owners
 
     def _insert_data_points(
         self,
         db_session: DbSession,
-        creators: list[TimeSeriesSampleCreate],
-        source_map: dict[DataSourceIdentity, UUID],
+        rows: list["DataPointSeriesRepository._StagingRow"],
+        spans: dict[tuple[UUID, int], "_StagedSpan"],
     ) -> WriteCounts:
-        """Batch insert data points.
+        """Batch insert data points via COPY into a staging table + one merge statement.
 
-        Inserts data points in batches to stay within PostgreSQL's parameter limit
-        of 65,535 parameters per query. With 6 fields per record, we batch at ~10k records.
-
-        Returns the split of rows actually written (inserted vs updated). The split
-        is derived from ``RETURNING (xmax = 0)`` on the same upsert statement — a
-        freshly inserted row has ``xmax = 0``, an updated (conflicting) row does
-        not — so it costs no extra query or round-trip.
+        Returns the split of rows actually written (inserted vs updated). The split is
+        derived from ``RETURNING (xmax = 0)`` on the merge statement.
         """
-        values_list = []
-        for creator in creators:
-            identity: DataSourceIdentity = (creator.user_id, creator.device_model, creator.source)
-            source_id = source_map.get(identity)
 
-            if not source_id:
-                # Should not happen if resolve logic is correct, but safe skip
-                continue
+        raw_conn: PGConnection | None = db_session.connection().connection.driver_connection
+        assert raw_conn is not None, "no DBAPI connection on an active Session"
+        with raw_conn.cursor() as cursor:
+            # Create the temporary staging table for bulk-importing data points.
+            model_columns = DataPointSeries.__table__.c
+            staging_table = Table(
+                "data_point_series_staging",
+                MetaData(),
+                *(Column(name, model_columns[name].type) for name in self._StagingRow._fields),
+                prefixes=["TEMPORARY"],
+                postgresql_on_commit="DELETE ROWS",
+            )
+            staging_ddl = str(CreateTable(staging_table, if_not_exists=True).compile(dialect=postgresql.dialect()))
+            cursor.execute(typing_cast(LiteralString, staging_ddl))
+            cursor.execute("TRUNCATE data_point_series_staging")
+            # Raw psycopg connection sharing this Session's transaction - COPY has no
+            # SQLAlchemy Core equivalent, and using a separate connection would commit
+            # outside this transaction.
+            with cursor.copy(f"COPY data_point_series_staging ({self._COPY_COLUMNS_SQL}) FROM STDIN") as copy:
+                for row in rows:
+                    copy.write_row(row)
 
-            values_list.append(
-                {
-                    "id": creator.id,
-                    "external_id": creator.external_id,
-                    "data_source_id": source_id,
-                    "recorded_at": creator.recorded_at,
-                    "zone_offset": creator.zone_offset,
-                    "value": creator.value,
-                    "series_type_definition_id": get_series_type_id(creator.series_type),
-                    "is_daily_total": creator.is_daily_total,
-                }
+            cursor.execute(
+                f"""
+                    WITH merged AS (
+                        INSERT INTO data_point_series ({self._COPY_COLUMNS_SQL})
+                        SELECT {self._COPY_COLUMNS_SQL} FROM data_point_series_staging
+                        ORDER BY data_source_id, series_type_definition_id, recorded_at
+                        ON CONFLICT (data_source_id, series_type_definition_id, recorded_at)
+                        DO UPDATE SET
+                            external_id = excluded.external_id,
+                            value = excluded.value,
+                            zone_offset = excluded.zone_offset,
+                            is_daily_total = excluded.is_daily_total
+                        WHERE data_point_series.value IS DISTINCT FROM excluded.value
+                           OR data_point_series.external_id IS DISTINCT FROM excluded.external_id
+                           OR data_point_series.zone_offset IS DISTINCT FROM excluded.zone_offset
+                           OR data_point_series.is_daily_total IS DISTINCT FROM excluded.is_daily_total
+                        RETURNING (xmax = 0) AS was_insert, series_type_definition_id
+                    )
+                    SELECT series_type_definition_id, count(*) FILTER (WHERE was_insert) AS inserted
+                    FROM merged
+                    GROUP BY series_type_definition_id
+                """
+            )
+            inserted_by_type_id = dict(cursor.fetchall())
+
+        # Staged per type across its sources; updated is staged minus inserted, matching the
+        # run-level split: a conflict whose values were unchanged never reaches RETURNING,
+        # and still counts as written.
+        staged_by_type: dict[int, TypeCounts] = {}
+        for (_, type_id), span in spans.items():
+            staged = TypeCounts(0, span.staged, span.start, span.end)
+            known = staged_by_type.get(type_id)
+            staged_by_type[type_id] = staged if known is None else known.merged_with(staged)
+        by_type: dict[str, TypeCounts] = {}
+        for type_id, staged in staged_by_type.items():
+            inserted_for_type = inserted_by_type_id.get(type_id, 0)
+            by_type[get_series_type_from_id(type_id).value] = staged._replace(
+                inserted=inserted_for_type, updated=staged.updated - inserted_for_type
             )
 
-        if values_list:
-            # Deduplicate within the batch: PostgreSQL cannot upsert the same row
-            # twice in one INSERT. Keep the last value for each conflict key.
-            deduped: dict[tuple, dict] = {}
-            for v in values_list:
-                key = (v["data_source_id"], v["series_type_definition_id"], v["recorded_at"])
-                deduped[key] = v
-            values_list = list(deduped.values())
-
-            inserted = 0
-            updated = 0
-            for i in range(0, len(values_list), self.BATCH_INSERT_CHUNK_SIZE):
-                chunk = values_list[i : i + self.BATCH_INSERT_CHUNK_SIZE]
-                stmt = insert(self.model).values(chunk)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["data_source_id", "series_type_definition_id", "recorded_at"],
-                    set_={
-                        "value": stmt.excluded.value,
-                        "external_id": stmt.excluded.external_id,
-                        "zone_offset": stmt.excluded.zone_offset,
-                        "is_daily_total": stmt.excluded.is_daily_total,
-                    },
-                    # RETURNING (xmax = 0): true = row freshly inserted, false = hit a
-                    # conflict and was updated in place. Same statement, no extra round-trip.
-                ).returning(literal_column("(xmax = 0)"))
-                for is_insert in db_session.execute(stmt).scalars():
-                    if is_insert:
-                        inserted += 1
-                    else:
-                        updated += 1
-            # NOTE: Caller should commit - allows batching multiple operations
-            return WriteCounts(inserted, updated)
-
-        return WriteCounts(0, 0)
+        inserted = sum(inserted_by_type_id.values())
+        return WriteCounts(inserted, len(rows) - inserted, by_type)
 
     def try_commit(self, db_session: DbSession, creation: DataPointSeries) -> DataPointSeries:
         try:
@@ -247,67 +452,35 @@ class DataPointSeriesRepository(
             # Re-raise if not a duplicate or if existing record not found
             raise
 
-    def create_data_source(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> DataSource:
-        provider = self.data_source_repo.infer_provider_from_source(creator.source)
-        if creator.provider:
-            with contextlib.suppress(ValueError):
-                provider = ProviderName(creator.provider)
-
-        return self.data_source_repo.ensure_data_source(
-            db_session,
-            user_id=creator.user_id,
-            provider=provider,
-            user_connection_id=creator.user_connection_id,
-            device_model=creator.device_model,
-            software_version=creator.software_version,
-            source=creator.source,
-        )
-
     def get_samples(
         self,
         db_session: DbSession,
         params: TimeSeriesQueryParams,
         types: list[SeriesType],
         user_id: UUID,
-    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int]:
+        source_by_type: dict[int, UUID] | None = None,
+    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int | None]:
         """Get data points with filtering and keyset pagination.
 
-        Returns a tuple of (samples, total_count) where total_count is calculated
-        BEFORE applying cursor pagination, giving the total number of matching records.
+        Returns (samples, total_count). The count is a full aggregate over the largest table in
+        the system, so it is taken on the first page only and is None on every page reached by
+        cursor; the total cannot change under a keyset page, so the caller keeps the first value.
         """
-        query = (
+        query = self._apply_sample_filters(
             db_session.query(self.model, DataSource)
             .join(
                 DataSource,
                 self.model.data_source_id == DataSource.id,
             )
-            .filter(DataSource.user_id == user_id)
+            .filter(DataSource.user_id == user_id),
+            params,
+            types,
+            params.start_datetime,
+            params.end_datetime,
+            source_by_type,
         )
 
-        if types:
-            type_ids = [get_series_type_id(t) for t in types]
-            query = query.filter(self.model.series_type_definition_id.in_(type_ids))
-
-        if params.device_model:
-            query = query.filter(DataSource.device_model == params.device_model)
-
-        if params.source:
-            query = query.filter(DataSource.source == params.source)
-
-        if params.start_datetime:
-            query = query.filter(self.model.recorded_at >= params.start_datetime)
-
-        if params.end_datetime:
-            # If user didnt specify an hour, minute nor second, add 1 day to include the entire day
-            end_dt = params.end_datetime
-            # Check if the time part after the date is 00:00:00
-            if end_dt.time() == time.min:
-                end_dt = end_dt + timedelta(days=1)
-            query = query.filter(self.model.recorded_at < end_dt)
-
-        # Calculate total count BEFORE applying cursor pagination
-        # This gives us the total matching records (after all other filters)
-        total_count = query.count()
+        total_count = query.count() if params.cursor is None else None
 
         # Cursor pagination (keyset)
         if params.cursor:
@@ -323,22 +496,302 @@ class DataPointSeriesRepository(
                 limit = params.limit or 50
                 results = query.limit(limit + 1).all()
                 # Reverse to get correct order
-                return list(reversed(results)), total_count  # ty:ignore[invalid-return-type]
+                return list(reversed(results)), total_count
             # Forward pagination: get items AFTER cursor
             query = query.filter(
                 tuple_(self.model.recorded_at, self.model.id) > (cursor_ts, cursor_id),
             )
 
         # Normal ascending order for forward pagination
-        query = query.order_by(asc(self.model.recorded_at), asc(self.model.id))
+        query = query.order_by(self.model.recorded_at.asc(), self.model.id.asc())
 
         # Limit + 1 to check for next page
         limit = params.limit or 50
-        return query.limit(limit + 1).all(), total_count  # ty:ignore[invalid-return-type]
+        return query.limit(limit + 1).all(), total_count
+
+    def get_aggregated_samples(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+        source_by_type: dict[int, UUID] | None = None,
+    ) -> tuple[list[AggregatedSample], bool]:
+        """Bucket samples into fixed-width windows, one row per (bucket, source, series type).
+
+        Scans at most ``limit + 1`` buckets rather than the requested range: LIMIT cannot be
+        pushed through a GROUP BY, so without the cap a month of 1 Hz data sorts every matching
+        row (~50 MB to disk) just to return one page. Returns the rows and whether more follow.
+        """
+        bucket_size = BUCKET_SIZES[params.resolution]
+        limit = params.limit or 50
+
+        start, end, backward = self._resolve_window(params, bucket_size)
+        if start is not None and end is not None and start >= end:
+            return [], False
+        requested_start, requested_end = start, end
+
+        if not backward:
+            start = (
+                self._first_sample_at_or_after(db_session, params, types, user_id, start, end, source_by_type) or start
+            )
+            if start is None:
+                return [], False
+
+        span = bucket_size * (limit + 1)
+        if backward and end is not None:
+            start = end - span if start is None else max(start, end - span)
+        elif not backward and start is not None:
+            end = start + span if end is None else min(end, start + span)
+
+        bucket = func.date_bin(
+            cast(literal(f"{int(bucket_size.total_seconds())} seconds"), Interval),
+            self.model.recorded_at,
+            literal(datetime(1970, 1, 1, tzinfo=timezone.utc)),
+        ).label("bucket")
+
+        # DataSource is joined to filter by owner, never selected: its columns would ride
+        # through the pre-aggregation sort and double what spills to disk.
+        query = self._apply_sample_filters(
+            db_session.query(
+                bucket,
+                self.model.series_type_definition_id.label("series_type_definition_id"),
+                self.model.data_source_id.label("data_source_id"),
+                self._aggregated_value(types).label("value"),
+                func.min(self.model.zone_offset).label("zone_offset"),
+            )
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id)
+            # A day's own total would land inside one bucket and double-count the day.
+            .filter(self.model.is_daily_total.isnot(True))
+            .group_by(bucket, self.model.series_type_definition_id, self.model.data_source_id)
+            .order_by(
+                bucket.desc() if backward else bucket,
+                self.model.data_source_id,
+                self.model.series_type_definition_id,
+            ),
+            params,
+            types,
+            start,
+            end,
+            source_by_type,
+        )
+
+        rows = query.all()
+        sources = self._sources_by_id(db_session, {r.data_source_id for r in rows})
+        samples = [
+            AggregatedSample(
+                bucket=r.bucket,
+                series_type_definition_id=r.series_type_definition_id,
+                value=r.value,
+                zone_offset=r.zone_offset,
+                is_daily_total=False,
+                data_source=sources[r.data_source_id],
+            )
+            for r in rows
+        ]
+        # A capped window is not a next page on its own: hand out a cursor only if the slice of
+        # the requested range we skipped actually holds data.
+        skipped = (requested_start, start) if backward else (end, requested_end)
+        has_more = skipped[0] != skipped[1] and (
+            self._first_sample_at_or_after(db_session, params, types, user_id, *skipped, source_by_type) is not None
+        )
+        return samples, has_more
+
+    @staticmethod
+    def _sources_by_id(db_session: DbSession, source_ids: set[UUID]) -> dict[UUID, DataSource]:
+        if not source_ids:
+            return {}
+        return {s.id: s for s in db_session.query(DataSource).filter(DataSource.id.in_(source_ids))}
+
+    def _apply_sample_filters(
+        self,
+        query: Query,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        start: datetime | None,
+        end: datetime | None,
+        source_by_type: dict[int, UUID] | None = None,
+    ) -> Query:
+        """Filters shared by every sample read. Assumes DataSource is already joined."""
+        if types:
+            query = query.filter(self.model.series_type_definition_id.in_([get_series_type_id(t) for t in types]))
+        query = query.filter(*source_filter_conditions(params, self.model.data_source_id))
+        if start is not None:
+            query = query.filter(self.model.recorded_at >= start)
+        if end is not None:
+            query = query.filter(self.model.recorded_at < end)
+        if source_by_type is not None:
+            query = query.filter(
+                tuple_(self.model.series_type_definition_id, self.model.data_source_id).in_(
+                    list(source_by_type.items())
+                )
+            )
+        return query
+
+    def winning_source_by_series_type(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+        provider_order: dict,
+        device_type_order: dict,
+    ) -> dict[int, UUID]:
+        """Best-ranked data source per series type, among those holding data in the window.
+
+        Decided on source metadata plus one existence probe per (source, series type), so the
+        cost tracks the number of devices a user owns rather than the number of samples. The
+        winner is resolved per series type, so a watch with heart rate but no GPS keeps the
+        heart rate and yields only the GPS series to the next source.
+        """
+        ranked = self._ranked_sources(db_session, params, user_id, provider_order, device_type_order)
+        type_ids = [get_series_type_id(t) for t in types] if types else SERIES_TYPE_IDS
+        if not ranked or not type_ids:
+            return {}
+
+        start, end = params.start_datetime, params.end_datetime
+        candidates = values(
+            column("type_id", Integer),
+            column("source_id", PGUUID(as_uuid=True)),
+            name="candidates",
+        ).data([(type_id, source.id) for type_id in type_ids for source in ranked])
+        available = [self.model.recorded_at >= start] if start is not None else []
+        if end is not None:
+            available.append(self.model.recorded_at < end)
+        if params.resolution is not Resolution.RAW:
+            # Bucketed reads drop daily totals, so a source holding only those has nothing to
+            # offer here and must not outrank one with real intraday samples.
+            available.append(self.model.is_daily_total.isnot(True))
+        probe = (
+            select(literal_column("1"))
+            .where(
+                self.model.data_source_id == candidates.c.source_id,
+                self.model.series_type_definition_id == candidates.c.type_id,
+                *available,
+            )
+            # Ordering on the index's trailing column lets the planner stop at the first match
+            # instead of costing this as a full scan once a non-indexed filter is present.
+            .order_by(self.model.recorded_at)
+            .limit(1)
+            .lateral("probe")
+        )
+        populated = db_session.execute(
+            select(candidates.c.type_id, candidates.c.source_id).select_from(candidates.join(probe, true()))
+        ).all()
+
+        rank_of = {source.id: position for position, source in enumerate(ranked)}
+        winners: dict[int, UUID] = {}
+        for type_id, source_id in populated:
+            if type_id not in winners or rank_of[source_id] < rank_of[winners[type_id]]:
+                winners[type_id] = source_id
+        return winners
+
+    def _ranked_sources(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        user_id: UUID,
+        provider_order: dict,
+        device_type_order: dict,
+    ) -> list[DataSource]:
+        """The caller's sources, best first. Honours the source filters, so priority picks a
+        winner from what the request actually asked for rather than from everything owned."""
+        query = db_session.query(DataSource).filter(
+            DataSource.user_id == user_id,
+            *source_filter_conditions(params, DataSource.id),
+        )
+        return sorted(
+            query.all(),
+            key=lambda s: (
+                provider_order.get(s.provider, _UNRANKED),
+                device_type_order.get(s.device_type, _UNRANKED),
+                s.id,
+            ),
+        )
+
+    def _first_sample_at_or_after(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+        start: datetime | None,
+        end: datetime | None,
+        source_by_type: dict[int, UUID] | None = None,
+    ) -> datetime | None:
+        """Timestamp of the earliest matching sample in the range, or None if there is none."""
+        return self._apply_sample_filters(
+            db_session.query(func.min(self.model.recorded_at))
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id),
+            params,
+            types,
+            start,
+            end,
+            source_by_type,
+        ).scalar()
+
+    def _resolve_window(
+        self,
+        params: TimeSeriesQueryParams,
+        bucket_size: timedelta,
+    ) -> tuple[datetime | None, datetime | None, bool]:
+        """Move the requested range to the cursor position. Returns (start, end, backward)."""
+        start = params.start_datetime
+        end = params.end_datetime
+
+        backward = False
+        if params.cursor:
+            cursor_ts, direction = decode_bucket_cursor(params.cursor)
+            backward = direction == "prev"
+            if backward:
+                end = cursor_ts
+            else:
+                start = cursor_ts + bucket_size
+
+        return as_utc(start), as_utc(end), backward
+
+    def _aggregated_value(self, types: list[SeriesType]) -> ColumnElement:
+        """Pick avg/sum/max per series type from the shared coverage map, defaulting to avg."""
+        requested = {get_series_type_id(t) for t in types} if types else None
+        branches = []
+        for method, type_ids in _TYPE_IDS_BY_METHOD.items():
+            ids = sorted(type_ids & requested) if requested is not None else sorted(type_ids)
+            if ids:
+                branches.append(
+                    (self.model.series_type_definition_id.in_(ids), _AGGREGATE_FUNCS[method](self.model.value))
+                )
+        if not branches:
+            return func.avg(self.model.value)
+        return case(*branches, else_=func.avg(self.model.value))
 
     def get_total_count(self, db_session: DbSession) -> int:
         """Get total count of all data points."""
         return db_session.query(func.count(self.model.id)).scalar() or 0
+
+    @staticmethod
+    def _approximate_row_count(db_session: DbSession, table_name: str) -> int:
+        """Approximate row count of ``table_name`` from planner statistics (``pg_class.reltuples``).
+
+        Instant (metadata lookup, no table scan), unlike a full ``COUNT(*)``. The estimate is
+        refreshed by (auto)VACUUM/ANALYZE and may lag by a few percent, so it is only suitable for a
+        non-critical dashboard figure. Postgres reports reltuples = -1 for a never-ANALYZEd table;
+        clamp to 0.
+        """
+        result = db_session.execute(
+            text("SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass(:table)"),
+            {"table": table_name},
+        ).scalar()
+        return max(int(result or 0), 0)
+
+    def get_approximate_total_count(self, db_session: DbSession) -> int:
+        """Approximate total row count of the (hot) data point table."""
+        return self._approximate_row_count(db_session, self.model.__tablename__)
+
+    def get_approximate_archived_count(self, db_session: DbSession) -> int:
+        """Approximate row count of the archive table (archived data points)."""
+        return self._approximate_row_count(db_session, DataPointSeriesArchive.__tablename__)
 
     def get_count_in_range(self, db_session: DbSession, start_datetime: datetime, end_datetime: datetime) -> int:
         """Get count of data points within a datetime range."""
@@ -390,8 +843,11 @@ class DataPointSeriesRepository(
             db_session.query(
                 DataSource.provider,
                 SeriesTypeDefinition.code,
-                func.count(self.model.id).label("count"),
+                # count(*), not count(id): id is not in the (source, type, time) index,
+                # so counting it read every row from the table instead of the index.
+                func.count().label("count"),
             )
+            .select_from(self.model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .join(SeriesTypeDefinition, self.model.series_type_definition_id == SeriesTypeDefinition.id)
             .filter(DataSource.user_id == user_id)
@@ -403,23 +859,45 @@ class DataPointSeriesRepository(
 
         results = (
             query.group_by(DataSource.provider, SeriesTypeDefinition.code)
-            .order_by(DataSource.provider, func.count(self.model.id).desc())
+            .order_by(DataSource.provider, func.count().desc())
             .all()
         )
         return [(provider, code, count) for provider, code, count in results]
 
-    def get_count_by_series_type(self, db_session: DbSession) -> list[tuple[int, int]]:
-        """Get count of data points grouped by series type ID.
+    def get_user_timeline_counts(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        bucket: TimelineBucket,
+        group_by: TimelineGroupBy,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        provider: ProviderName | None = None,
+    ) -> list[tuple[str, date, int]]:
+        """Data point counts for a user, bucketed by time and grouped by provider or series type.
 
-        Returns list of (series_type_definition_id, count) tuples ordered by count descending.
+        Returns (key, bucket_start, count) for non-empty buckets only.
         """
-        results = (
-            db_session.query(self.model.series_type_definition_id, func.count(self.model.id).label("count"))
-            .group_by(self.model.series_type_definition_id)
-            .order_by(func.count(self.model.id).desc())
-            .all()
+        bucket_start = utc_bucket_start(bucket, self.model.recorded_at)
+        key_column = timeline_key_column(group_by)
+
+        query = (
+            db_session.query(key_column, bucket_start, func.count().label("count"))
+            .select_from(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
         )
-        return [(series_type_definition_id, count) for series_type_definition_id, count in results]
+        if group_by is TimelineGroupBy.SERIES_TYPE:
+            query = query.join(SeriesTypeDefinition, self.model.series_type_definition_id == SeriesTypeDefinition.id)
+        query = query.filter(DataSource.user_id == user_id)
+        if provider is not None:
+            query = query.filter(DataSource.provider == provider)
+        if start_datetime is not None:
+            query = query.filter(self.model.recorded_at >= start_datetime)
+        if end_datetime is not None:
+            query = query.filter(self.model.recorded_at < end_datetime)
+
+        results = query.group_by(key_column, bucket_start).order_by(key_column, bucket_start).all()
+        return [(key, bucket_start_value, count) for key, bucket_start_value, count in results]
 
     def get_count_by_source(self, db_session: DbSession) -> list[tuple[str | None, int]]:
         """Get count of data points grouped by source.
@@ -438,54 +916,88 @@ class DataPointSeriesRepository(
     def get_avg_hr_for_workout_batch(
         self,
         db_session: DbSession,
-        workouts: list[tuple[UUID, UUID, datetime, datetime]],
+        workouts: list[WorkoutWindow],
     ) -> dict[UUID, int]:
         """Batch-compute average HR from series data for multiple workout windows.
 
-        Issues a single query using a VALUES CTE joined against data_point_series.
-        Filters by data_source_id so HR data comes from the same device as the workout.
-
-        Args:
-            workouts: List of (record_id, data_source_id, start_time, end_time) tuples.
+        One query per chunk of workouts, a VALUES CTE joined against data_point_series with one
+        index range scan per (workout, source). HR from the workout's own source wins; the fallback
+        sources are used only when it has none in the window.
 
         Returns:
             Dict mapping record_id to rounded avg HR. Workouts with no HR data are omitted.
         """
-        if not workouts:
-            return {}
+        result: dict[UUID, int] = {}
+        chunk: list[WorkoutWindow] = []
+        rows = 0
+        for workout in workouts:
+            # A workout's sources stay in one chunk, so its fallback average covers all of them
+            workout_rows = 1 + len(workout.fallback_source_ids)
+            if chunk and rows + workout_rows > _MAX_WINDOW_ROWS:
+                result |= self._avg_hr_for_windows(db_session, chunk)
+                chunk, rows = [], 0
+            chunk.append(workout)
+            rows += workout_rows
+        if chunk:
+            result |= self._avg_hr_for_windows(db_session, chunk)
+        return result
 
-        hr_type_id = get_series_type_id(SeriesType.heart_rate)
-
-        values_parts = []
-        params: dict[str, object] = {"hr_type_id": hr_type_id}
-        for i, (record_id, data_source_id, start_time, end_time) in enumerate(workouts):
-            values_parts.append(f"""(
-                CAST(:record_id_{i} AS uuid),
-                CAST(:ds_id_{i} AS uuid),
-                CAST(:start_{i} AS timestamptz),
-                CAST(:end_{i} AS timestamptz)
-            )""")
-            params[f"record_id_{i}"] = str(record_id)
-            params[f"ds_id_{i}"] = str(data_source_id)
-            params[f"start_{i}"] = start_time
-            params[f"end_{i}"] = end_time
+    def _avg_hr_for_windows(self, db_session: DbSession, workouts: list[WorkoutWindow]) -> dict[UUID, int]:
+        # Windows are passed as literals: computed in SQL, the planner loses the time bounds on the index
+        values_parts: list[str] = []
+        params: dict[str, object] = {"hr_type_id": get_series_type_id(SeriesType.heart_rate)}
+        for workout in workouts:
+            sources = [(workout.data_source_id, True), *((source, False) for source in workout.fallback_source_ids)]
+            for data_source_id, is_own in sources:
+                i = len(values_parts)
+                values_parts.append(f"""(
+                    CAST(:record_id_{i} AS uuid),
+                    CAST(:ds_id_{i} AS uuid),
+                    CAST(:is_own_{i} AS boolean),
+                    CAST(:start_{i} AS timestamptz),
+                    CAST(:end_{i} AS timestamptz)
+                )""")
+                params[f"record_id_{i}"] = str(workout.record_id)
+                params[f"ds_id_{i}"] = str(data_source_id)
+                params[f"is_own_{i}"] = is_own
+                params[f"start_{i}"] = workout.start_time
+                params[f"end_{i}"] = workout.end_time
 
         sql = text(f"""
-            WITH workout_windows(record_id, data_source_id, start_time, end_time) AS (
+            WITH workout_windows(record_id, data_source_id, is_own, start_time, end_time) AS (
                 VALUES {", ".join(values_parts)}
             )
-            SELECT ww.record_id, ROUND(AVG(dps.value))::int
+            SELECT ww.record_id, ww.is_own, ROUND(AVG(dps.value))::int
             FROM workout_windows ww
             JOIN data_point_series dps
                 ON dps.data_source_id = ww.data_source_id
                 AND dps.series_type_definition_id = :hr_type_id
                 AND dps.recorded_at >= ww.start_time
                 AND dps.recorded_at < ww.end_time
-            GROUP BY ww.record_id
+            GROUP BY ww.record_id, ww.is_own
         """)
 
-        rows = db_session.execute(sql, params).fetchall()
-        return {UUID(str(record_id)): int(avg) for record_id, avg in rows}
+        own_avg: dict[UUID, int] = {}
+        fallback_avg: dict[UUID, int] = {}
+        for record_id, is_own, avg in db_session.execute(sql, params).fetchall():
+            (own_avg if is_own else fallback_avg)[UUID(str(record_id))] = int(avg)
+        return fallback_avg | own_avg
+
+    def _local_day_window(
+        self, local_date: ColumnElement, start_date: datetime, end_date: datetime
+    ) -> list[ColumnElement[bool]]:
+        """Samples whose local date falls in [start, end).
+
+        Bounded on `recorded_at` as well, a day wider each side to cover any offset:
+        the local date is an expression no index can use, so without it a window
+        scanned from its start to the newest sample.
+        """
+        return [
+            self.model.recorded_at >= start_date - timedelta(days=1),
+            self.model.recorded_at < end_date + timedelta(days=1),
+            local_date >= cast(start_date, Date),
+            local_date < cast(end_date, Date),
+        ]
 
     def get_daily_activity_aggregates(
         self,
@@ -499,15 +1011,16 @@ class DataPointSeriesRepository(
         Aggregates steps, energy, heart rate stats by date for a user.
 
         Returns list of dicts with keys:
-        - activity_date, source, device_model
-        - steps_sum, active_energy_sum, basal_energy_sum
+        - activity_date, provider, source, device_model, device_type
+        - steps_sum, active_energy_sum, basal_energy_sum, total_energy_sum
         - hr_avg, hr_max, hr_min
         - distance_sum, flights_climbed_sum
         """
         # Series type IDs we need
         steps_id = get_series_type_id(SeriesType.steps)
-        energy_id = get_series_type_id(SeriesType.energy)
+        energy_id = get_series_type_id(SeriesType.active_energy)
         basal_energy_id = get_series_type_id(SeriesType.basal_energy)
+        total_energy_id = get_series_type_id(SeriesType.total_energy)
         hr_id = get_series_type_id(SeriesType.heart_rate)
         distance_id = get_series_type_id(SeriesType.distance_walking_running)
         flights_id = get_series_type_id(SeriesType.flights_climbed)
@@ -550,12 +1063,18 @@ class DataPointSeriesRepository(
                 DataSource.provider.label("provider"),
                 DataSource.source.label("source"),
                 DataSource.device_model.label("device_model"),
+                # device_type is functionally dependent on the three columns above
+                # (uq_data_source_identity is unique per user on provider/device_model/source),
+                # so adding it to the GROUP BY cannot change the number of groups.
+                DataSource.device_type.label("device_type"),
                 # Steps - prefer daily total, else sum samples
                 prefer_daily_sum(steps_id).label("steps_sum"),
                 # Active energy - prefer daily total, else sum samples
                 prefer_daily_sum(energy_id).label("active_energy_sum"),
                 # Basal energy - prefer daily total, else sum samples
                 prefer_daily_sum(basal_energy_id).label("basal_energy_sum"),
+                # Total energy - providers that report active + basal without a split
+                prefer_daily_sum(total_energy_id).label("total_energy_sum"),
                 # Heart rate stats
                 func.avg(case((self.model.series_type_definition_id == hr_id, self.model.value), else_=None)).label(
                     "hr_avg"
@@ -576,11 +1095,18 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
-                local_date >= cast(start_date, Date),
-                local_date < cast(end_date, Date),
+                *self._local_day_window(local_date, start_date, end_date),
                 self.model.series_type_definition_id.in_(
-                    [steps_id, energy_id, basal_energy_id, hr_id, distance_id, flights_id, active_time_id]
+                    [
+                        steps_id,
+                        energy_id,
+                        basal_energy_id,
+                        total_energy_id,
+                        hr_id,
+                        distance_id,
+                        flights_id,
+                        active_time_id,
+                    ]
                 ),
             )
             .group_by(
@@ -588,6 +1114,7 @@ class DataPointSeriesRepository(
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
+                DataSource.device_type,
             )
             .order_by(asc(local_date))
             .all()
@@ -602,9 +1129,11 @@ class DataPointSeriesRepository(
                     "provider": row.provider,
                     "source": row.source,
                     "device_model": row.device_model,
-                    "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
-                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum else 0.0,
-                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum else 0.0,
+                    "device_type": row.device_type,
+                    "steps_sum": int(row.steps_sum) if row.steps_sum is not None else None,
+                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum is not None else None,
+                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum is not None else None,
+                    "total_energy_sum": float(row.total_energy_sum) if row.total_energy_sum is not None else None,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": int(row.hr_max) if row.hr_max is not None else None,
                     "hr_min": int(row.hr_min) if row.hr_min is not None else None,
@@ -661,9 +1190,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
-                local_date >= cast(start_date, Date),
-                local_date < cast(end_date, Date),
+                *self._local_day_window(local_date, start_date, end_date),
                 self.model.series_type_definition_id == steps_id,
                 self.model.is_daily_total.isnot(True),
             )
@@ -764,9 +1291,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
-                local_date >= cast(start_date, Date),
-                local_date < cast(end_date, Date),
+                *self._local_day_window(local_date, start_date, end_date),
                 self.model.series_type_definition_id == hr_id,
             )
             .group_by(
@@ -847,7 +1372,7 @@ class DataPointSeriesRepository(
         user_id: UUID,
         before_date: datetime,
         series_types: list[SeriesType],
-    ) -> dict[SeriesType, tuple[float, datetime, str | None, str | None]]:
+    ) -> dict[SeriesType, tuple[float, datetime, str | None, str | None, str | None, str | None]]:
         """Get the most recent value for each series type before a given date.
 
         Used for slow-changing measurements like weight, height, body fat %.
@@ -856,7 +1381,8 @@ class DataPointSeriesRepository(
             before_date: Only consider measurements recorded before this datetime
 
         Returns:
-            Dict mapping SeriesType to tuple of (value, recorded_at, source, device_model)
+            Dict mapping SeriesType to tuple of
+            (value, recorded_at, provider, source, device_model, device_type)
         """
         if not series_types:
             raise ValueError("series_types cannot be empty")
@@ -887,8 +1413,10 @@ class DataPointSeriesRepository(
                 self.model.series_type_definition_id,
                 self.model.value,
                 self.model.recorded_at,
+                DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
+                DataSource.device_type,
             )
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .outerjoin(ProviderPriority, DataSource.provider == ProviderPriority.provider)
@@ -915,11 +1443,11 @@ class DataPointSeriesRepository(
         )
 
         # Build result dict
-        latest_values: dict[SeriesType, tuple[float, datetime, str | None, str | None]] = {}
-        for type_id, value, recorded_at, source, device_model in results:
+        latest_values: dict[SeriesType, tuple[float, datetime, str | None, str | None, str | None, str | None]] = {}
+        for type_id, value, recorded_at, provider, source, device_model, device_type in results:
             try:
                 series_type = get_series_type_from_id(type_id)
-                latest_values[series_type] = (float(value), recorded_at, source, device_model)
+                latest_values[series_type] = (float(value), recorded_at, provider, source, device_model, device_type)
             except KeyError:
                 pass
 
@@ -988,7 +1516,7 @@ class DataPointSeriesRepository(
         series_type: SeriesType,
         window_start: datetime,
         window_end: datetime,
-    ) -> tuple[float, datetime, str, str | None] | None:
+    ) -> tuple[float, datetime, str | None, str | None] | None:
         """Get the most recent reading for a series type within a time window.
 
         Used for point-in-time metrics like body temperature that are only

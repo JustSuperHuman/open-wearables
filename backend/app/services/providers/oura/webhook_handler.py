@@ -38,6 +38,7 @@ from fastapi import HTTPException, Request
 from pydantic import ValidationError
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryQueue, CeleryTask
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.schemas.providers.oura import OuraWebhookNotification
@@ -48,8 +49,6 @@ from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import LogContext, log_structured
 
 logger = logging.getLogger(__name__)
-
-_PROCESS_PUSH_TASK = "app.integrations.celery.tasks.webhook_push_task.process_webhook_push"
 
 SUPPORTED_DATA_TYPES = [
     "workout",
@@ -146,7 +145,9 @@ class OuraWebhookHandler(BaseWebhookHandler):
 
         store_raw_payload(source="webhook", provider="oura", payload=payload, trace_id=request_trace_id)
 
-        task = celery_app.send_task(_PROCESS_PUSH_TASK, args=["oura", payload, request_trace_id], queue="webhook_sync")
+        task = celery_app.send_task(
+            CeleryTask.PROCESS_WEBHOOK_PUSH, args=["oura", payload, request_trace_id], queue=CeleryQueue.WEBHOOK_SYNC
+        )
         log_structured(
             logger,
             "info",
@@ -319,10 +320,11 @@ class OuraWebhookHandler(BaseWebhookHandler):
             return 0
 
         if data_type == "workout":
-            return self.workouts.save_by_id(db, user_id, object_id)
+            return self.workouts.save_by_id(db, user_id, object_id, trace_id=trace_id)
 
         collection = _COLLECTION_NAME.get(data_type, data_type)
-        raw = self.data_247._make_api_request(db, user_id, f"/v2/usercollection/{collection}/{object_id}")
+        endpoint = f"/v2/usercollection/{collection}/{object_id}"
+        raw = self.data_247._make_api_request(db, user_id, endpoint)
         if not raw or not isinstance(raw, dict):
             log_structured(
                 logger,
@@ -336,6 +338,14 @@ class OuraWebhookHandler(BaseWebhookHandler):
                 object_id=object_id,
             )
             return 0
+
+        store_raw_payload(
+            source="api_response",
+            provider="oura",
+            payload=raw,
+            user_id=str(user_id),
+            trace_id=trace_id,
+        )
 
         docs = [raw]
 

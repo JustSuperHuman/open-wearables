@@ -201,10 +201,11 @@ Fired once when a complete session is saved or merged.
 
 | Event | Description |
 |-------|-------------|
-| `connection.created` | A user successfully connected a wearable provider. |
-| `connection.revoked` | A connection became invalid or was disconnected (refresh token expired/revoked, the user deregistered on the provider side, or the user manually disconnected). The user must re-authorize to resume syncing. |
+| `connection.created` | A user successfully connected a wearable provider. For OAuth providers this fires when authorization completes; SDK providers have no OAuth callback, so it fires when the first data upload arrives, and again when a previously revoked SDK connection resumes uploading. |
+| `connection.revoked` | A connection became invalid or was disconnected (refresh token expired/revoked, the user deregistered on the provider side, or the user manually disconnected). OAuth connections require re-authorization to resume syncing; SDK connections resume on the next upload. See the `reason` field. |
 | `workout.created` | A new workout session was saved. |
 | `sleep.created` | A new (or merged) sleep session was saved. |
+| `meal.created` | A new meal or nutrition-log entry was saved. |
 | `menstrual_cycle.created` | A new menstrual cycle record was saved. |
 | `activity.created` | A new generic activity session was saved. |
 
@@ -217,7 +218,7 @@ Fired per ingestion batch — one event per distinct `(user, provider, series_ty
 | `heart_rate.created` | `heart_rate`, `resting_heart_rate`, `walking_heart_rate_average`, `atrial_fibrillation_burden` |
 | `heart_rate_variability.created` | `heart_rate_variability_sdnn`, `heart_rate_variability_rmssd` |
 | `steps.created` | `steps` |
-| `calories.created` | `energy`, `basal_energy` |
+| `calories.created` | `active_energy`, `basal_energy`, `total_energy` |
 | `spo2.created` | `oxygen_saturation`, `peripheral_perfusion_index` |
 | `respiratory_rate.created` | `respiratory_rate`, `sleeping_breathing_disturbances` |
 | `body_temperature.created` | `body_temperature`, `skin_temperature`, `skin_temperature_deviation` |
@@ -254,7 +255,14 @@ Every payload envelope has `type` (the event name as a string) and `data`.
 
 ### `connection.revoked`
 
-`reason` is a short cause, e.g. `refresh_failed`, `deregistration`, or `user_disconnected`.
+`reason` is a short cause:
+
+| Reason | Cause |
+|--------|-------|
+| `user_disconnected` | The connection was disconnected via the API. |
+| `sdk_sign_out` | The user signed out of the mobile app; the SDK reported it with its own token. |
+| `refresh_failed` | The OAuth refresh token was rejected by the provider. |
+| `deregistration` | The user deregistered on the provider side (Garmin). |
 
 ```json
 {
@@ -302,6 +310,8 @@ Every payload envelope has `type` (the event name as a string) and `data`.
 
 ### `sleep.created`
 
+`sleep_stage_intervals` below is shown **abbreviated** — three intervals out of a full night — to keep the example short. A real payload's array covers the entire session end-to-end (typically 15-60+ merged intervals, depending on how fragmented the sleep was).
+
 ```json
 {
   "type": "sleep.created",
@@ -312,9 +322,13 @@ Every payload envelope has `type` (the event name as a string) and `data`.
     "end_time": "2025-12-20T06:45:00+01:00",
     "zone_offset": "+01:00",
     "duration_seconds": 30600.0,
+    "sleep_duration_seconds": 29400.0,
     "source": {
       "provider": "oura",
-      "device": "Oura Ring Gen3"
+      "source": "oura",
+      "device": "Oura Ring Gen3",
+      "device_type": "ring",
+      "device_name": "Oura Ring Gen3"
     },
     "efficiency_percent": 87.0,
     "stages": {
@@ -323,10 +337,72 @@ Every payload envelope has `type` (the event name as a string) and `data`.
       "light_minutes": 215,
       "awake_minutes": 12
     },
+    "sleep_stage_intervals": [
+      {
+        "stage": "light",
+        "start_time": "2025-12-19T22:15:00+01:00",
+        "end_time": "2025-12-19T22:45:00+01:00"
+      },
+      {
+        "stage": "deep",
+        "start_time": "2025-12-19T22:45:00+01:00",
+        "end_time": "2025-12-19T23:30:00+01:00"
+      },
+      {
+        "stage": "rem",
+        "start_time": "2025-12-20T06:15:00+01:00",
+        "end_time": "2025-12-20T06:45:00+01:00"
+      }
+    ],
     "is_nap": false
   }
 }
 ```
+
+<Note>
+  `sleep_duration_seconds` is the time actually asleep (excludes awake periods within the session); `duration_seconds` is the total time-in-bed span. Both `source.source` (the third-party writer app, e.g. HealthKit/Health Connect) and `sleep_stage_intervals` are `null`/omitted when the provider or ingestion path did not report them. Unlike every other field in this example, `sleep_stage_intervals` above is **not** shown in full — see the note before the code block.
+</Note>
+
+### `meal.created`
+
+```json
+{
+  "type": "meal.created",
+  "data": {
+    "id": "e5f6a7b8-c9d0-1234-efab-234567890123",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "title": "Grilled Chicken Breast",
+    "meal_type": "lunch",
+    "start_time": "2025-12-19T12:30:00+01:00",
+    "end_time": "2025-12-19T12:30:00+01:00",
+    "zone_offset": "+01:00",
+    "source": {
+      "provider": "apple",
+      "device": "iPhone"
+    },
+    "calories_kcal": 550.0,
+    "macros": {
+      "protein_g": 38.2,
+      "carbohydrates_g": 42.0,
+      "fat_g": 18.5,
+      "fiber_g": 4.0
+    },
+    "water_ml": null,
+    "nutrients": {
+      "dietary_energy_consumed": { "value": 550.0, "unit": "kcal" },
+      "dietary_protein": { "value": 38.2, "unit": "g" },
+      "dietary_carbohydrates": { "value": 42.0, "unit": "g" },
+      "dietary_fat_total": { "value": 18.5, "unit": "g" },
+      "dietary_fiber": { "value": 4.0, "unit": "g" },
+      "dietary_sodium": { "value": 620.0, "unit": "mg" }
+    }
+  }
+}
+```
+
+<Note>
+  `title` and `meal_type` come from the provider's food-log entry (or HealthKit/Health Connect correlation metadata) and are `null` when not reported. `macros` is `null` when none of its four fields were recorded for the meal; each of `calories_kcal` and `water_ml` is `null` independently when that nutrient wasn't reported. `nutrients` holds every nutrient recorded for the meal, keyed by series type, the same as in `GET /events/meals`.
+</Note>
 
 ### `menstrual_cycle.created`
 
@@ -465,6 +541,22 @@ curl -X POST "http://localhost:8000/api/v1/webhooks/endpoints" \
 
 Omit the field entirely to receive all event types.
 
+To later remove the event type filter from an existing endpoint (receive all event types again), send a `PATCH` with `"filter_types": []`:
+
+```bash
+curl -X PATCH "http://localhost:8000/api/v1/webhooks/endpoints/ep_2t8Q4Xv9mNkRpLzYoB3cW7" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "filter_types": [] }'
+```
+
+<Note>
+  The empty list is what clears the filter. Sending `"filter_types": null` — or leaving the field
+  out — keeps the current filter, so a client that serialises unset fields as `null` will not wipe
+  an endpoint's event types by accident. Note that `user_id` works the other way round: there
+  `null` is what removes the filter.
+</Note>
+
 ### Filter by user
 
 Pass `user_id` to scope an endpoint to events for a single user. All other users' events are silently dropped before delivery.
@@ -599,7 +691,12 @@ Open Wearables (via Svix) retries failed deliveries automatically with exponenti
 
 <AccordionGroup>
   <Accordion title="Retry schedule">
-    Svix retries each failed message at increasing intervals. If all retries are exhausted the message is marked as failed in delivery history — you can inspect it and manually trigger a resend from the Svix dashboard.
+    Svix retries each failed message at increasing intervals. If all retries are exhausted the message is marked as failed in delivery history — you can inspect it and manually trigger a resend from the Svix dashboard, as long as its payload is still retained (see below).
+  </Accordion>
+  <Accordion title="Payload retention">
+    Svix stores each message payload for **7 days** by default, then deletes it. The message itself stays in delivery history, without the payload. Self-hosters can change this with `OUTGOING_WEBHOOK_PAYLOAD_RETENTION_DAYS` in the backend `.env` (5-90 days). The setting applies to messages sent after the change.
+
+    Keep the retention above the automatic retry window, which is about 28 hours and can stretch to roughly 3 days when your endpoint returns `Retry-After`. Once a payload is gone, Svix drops any pending retry without recording an attempt, and the message can no longer be resent.
   </Accordion>
   <Accordion title="Expected endpoint behaviour">
     - Respond with a `2xx` status code as quickly as possible (before doing any heavy processing).
@@ -608,6 +705,11 @@ Open Wearables (via Svix) retries failed deliveries automatically with exponenti
   </Accordion>
   <Accordion title="Webhook availability">
     Data ingestion is **never** blocked by webhook failures — if delivery infrastructure is temporarily unavailable, data continues to be stored and events are queued for retry.
+  </Accordion>
+  <Accordion title="User deletion">
+    When you delete a user (`DELETE /api/v1/users/{user_id}`), Open Wearables deletes the payloads of all their webhook messages from Svix in a background task, about a minute after the user is removed. The messages stay in delivery history without the payload, and their event IDs can still contain the user ID.
+
+    The cleanup is best-effort. The one-minute delay lets webhooks already queued for that user reach Svix first, so they are cleaned up too, but a webhook queued for longer than that (for example when the worker is backlogged) is not covered. If the cleanup task cannot be queued at all, the user is still deleted and a warning is logged. In both cases the remaining payloads are removed when their payload retention period ends.
   </Accordion>
 </AccordionGroup>
 

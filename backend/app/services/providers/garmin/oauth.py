@@ -39,7 +39,7 @@ class GarminOAuth(BaseOAuthTemplate):
     use_pkce = True
     auth_method = AuthenticationMethod.BODY
 
-    def deregister_user(self, access_token: str) -> None:
+    def deregister_user(self, access_token: str, provider_user_id: str | None = None) -> None:
         """Call Garmin's user deregistration endpoint to remove the app association."""
         response = httpx.delete(
             f"{self.api_base_url}/partner-gateway/rest/user/registration",
@@ -47,6 +47,15 @@ class GarminOAuth(BaseOAuthTemplate):
             timeout=30.0,
         )
         response.raise_for_status()
+
+    def get_user_id(self, access_token: str) -> str | None:
+        response = httpx.get(
+            f"{self.api_base_url}/partner-gateway/rest/user/id",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return response.json().get("userId")
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
         """Fetches Garmin user ID and API permissions."""

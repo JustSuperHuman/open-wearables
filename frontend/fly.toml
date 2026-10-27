@@ -1,4 +1,4 @@
-# Fly.io config for the Open Wearables frontend (Nitro node server on :3000).
+# Fly.io config for the Open Wearables frontend (SvelteKit adapter-node server, run by Bun on :3000).
 #
 # First time:   fly launch --no-deploy --copy-config --name open-wearables-frontend
 # Deploy:       fly deploy --env VITE_API_URL=https://open-wearables-api.fly.dev

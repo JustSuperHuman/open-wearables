@@ -8,21 +8,68 @@ from uuid import UUID
 from celery import shared_task
 from sqlalchemy.orm import Session
 
+from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.schemas.providers.apple.apple_xml import XMLParseStats
-from app.schemas.sync_status import SyncSource, SyncStatus
+from app.schemas.sync_status import (
+    DataTypeKind,
+    DataTypeOutcome,
+    SyncRunContext,
+    SyncScope,
+    SyncSource,
+    SyncStatus,
+)
 from app.services import event_record_service
-from app.services.apple.apple_xml.xml_service import XMLService
-from app.services.apple.healthkit.sleep_service import handle_sleep_data
-from app.services.sync_status_service import completed, failed, new_run_id, started
+from app.services.providers.apple.apple_xml.xml_service import XMLService
+from app.services.sdk.sleep_service import handle_sleep_data
+from app.services.sync_status_service import (
+    emit_sync_completed,
+    emit_sync_failed,
+    emit_sync_started,
+    new_run_id,
+    run_status_from,
+    try_record_data_types,
+)
 from app.services.timeseries_service import timeseries_service
+from app.utils.context import sync_run_context
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 log = getLogger(__name__)
 
 
-@shared_task
+def _xml_outcomes(stats: XMLParseStats) -> list[DataTypeOutcome]:
+    """Per-collection outcomes for an XML import.
+
+    The XML parser counts per collection rather than per series type, and only tracks
+    what it parsed, so reported_records is the parsed count and there is no
+    inserted/updated split.
+    """
+    outcomes = []
+    for name, metric in (("records", stats.records), ("workouts", stats.workouts), ("sleep", stats.sleep)):
+        if not metric.processed and not metric.skipped:
+            continue
+        match (bool(metric.processed), bool(metric.skipped)):
+            case (False, _):
+                status = SyncStatus.FAILED
+            case (_, True):
+                status = SyncStatus.PARTIAL
+            case _:
+                status = SyncStatus.SUCCESS
+        outcomes.append(
+            DataTypeOutcome(
+                data_type=name,
+                kind=DataTypeKind.TASK,
+                native_type=name,
+                status=status,
+                reported_records=metric.processed,
+                error=", ".join(f"{reason}: {count}" for reason, count in metric.reasons.most_common(3)) or None,
+            )
+        )
+    return outcomes
+
+
+@shared_task(name=CeleryTask.PROCESS_XML_UPLOAD)
 def process_xml_upload(file_contents: bytes, filename: str, user_id: str) -> dict[str, Any]:
     """
     Process XML file and import to Postgres database.
@@ -43,17 +90,22 @@ def process_xml_upload(file_contents: bytes, filename: str, user_id: str) -> dic
         user_uuid = None
 
     run_id = new_run_id(prefix="xml")
+    run = SyncRunContext(run_id=run_id, source=SyncSource.XML_IMPORT, scope=SyncScope.HISTORICAL)
     if user_uuid is not None:
-        started(
+        emit_sync_started(
             user_uuid,
             "apple",
-            SyncSource.XML_IMPORT,
-            run_id=run_id,
+            run.source,
+            scope=run.scope,
+            run_id=run.run_id,
             message=f"Importing Apple Health XML file {filename}",
             metadata={"filename": filename},
         )
 
-    with SessionLocal() as db:
+    with (
+        sync_run_context(run),
+        SessionLocal() as db,
+    ):
         try:
             temp_dir = tempfile.gettempdir()
             temp_xml_file = os.path.join(temp_dir, f"temp_import_{filename}")
@@ -64,16 +116,19 @@ def process_xml_upload(file_contents: bytes, filename: str, user_id: str) -> dic
             stats = _import_xml_data(db, temp_xml_file, user_id)
 
             if user_uuid is not None:
-                completed(
+                outcomes = _xml_outcomes(stats)
+                emit_sync_completed(
                     user_uuid,
                     "apple",
-                    SyncSource.XML_IMPORT,
-                    run_id=run_id,
-                    status=SyncStatus.SUCCESS,
+                    run.source,
+                    scope=run.scope,
+                    run_id=run.run_id,
+                    status=run_status_from(outcomes),
                     message="Apple Health XML import completed",
                     items_processed=stats.records.processed + stats.workouts.processed + stats.sleep.processed,
                     metadata={"filename": filename},
                 )
+                try_record_data_types(run.run_id, outcomes, scope=run.scope)
 
             return {
                 "user_id": user_id,
@@ -93,11 +148,12 @@ def process_xml_upload(file_contents: bytes, filename: str, user_id: str) -> dic
         except Exception as e:
             db.rollback()
             if user_uuid is not None:
-                failed(
+                emit_sync_failed(
                     user_uuid,
                     "apple",
-                    SyncSource.XML_IMPORT,
-                    run_id=run_id,
+                    run.source,
+                    scope=run.scope,
+                    run_id=run.run_id,
                     error=str(e),
                     message=f"Apple Health XML import failed: {filename}",
                     metadata={"filename": filename},

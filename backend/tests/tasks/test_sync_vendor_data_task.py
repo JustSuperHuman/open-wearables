@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
 from app.schemas.auth import ConnectionStatus
+from app.schemas.sync_status import SyncStatus
+from app.services.sync_coordination import try_become_primary
 from app.utils.sync_params import build_sync_params
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -242,7 +244,66 @@ class TestSyncVendorDataTask:
         assert str(result["user_id"]) == str(user.id)
         assert "garmin" in result["providers_synced"]
         assert result["providers_synced"]["garmin"]["params"]["workouts"]["success"] is False
-        assert "Provider API unavailable" in result["providers_synced"]["garmin"]["params"]["workouts"]["error"]
+        # The error's type only: its text could carry the rows a write failed on.
+        assert result["providers_synced"]["garmin"]["params"]["workouts"]["error_code"] == "Exception"
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.try_record_data_types")
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_a_run_where_everything_failed_still_records_its_data_types(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        mock_record: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy.workouts.load_data.side_effect = Exception("Provider API unavailable")
+        mock_strategy.data_247 = None
+        mock_get_provider.return_value = mock_strategy
+
+        sync_vendor_data(str(user.id))
+
+        outcomes = mock_record.call_args.args[1]
+        assert [(o.data_type, o.status) for o in outcomes] == [("workouts", SyncStatus.FAILED)]
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_records_data_types_before_the_runs_terminal_event(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """A consumer acting on sync.completed reads the per-type outcomes from the history."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy.workouts.load_data.return_value = 3
+        mock_strategy.data_247 = None
+        mock_get_provider.return_value = mock_strategy
+        calls = MagicMock()
+        task = "app.integrations.celery.tasks.sync_vendor_data_task"
+
+        with (
+            patch(f"{task}.try_record_data_types", calls.record),
+            patch(f"{task}.emit_sync_completed", calls.completed),
+        ):
+            sync_vendor_data(str(user.id))
+
+        assert [name for name, *_ in calls.mock_calls] == ["record", "completed"]
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
@@ -375,3 +436,55 @@ class TestBuildSyncParams:
         params = build_sync_params("invalid-date", "2025-12-31T23:59:59Z")
 
         assert params == {"start_date": "invalid-date", "end_date": "2025-12-31T23:59:59Z"}
+
+
+class TestSyncVendorDataLinkedSkip:
+    """A profile that loses the linked-account lock must not look like it synced."""
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_skip_reports_skipped_and_leaves_the_cursor_alone(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        holder = UserFactory()
+        provider_user_id = "shared-account-1"
+        connection = UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            provider_user_id=provider_user_id,
+        )
+        # The holder keeps an active connection, so the stale-lock steal path must not fire.
+        UserConnectionFactory(
+            user=holder,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            provider_user_id=provider_user_id,
+        )
+        try_become_primary("garmin", provider_user_id, holder.id, scope="pull")
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_get_provider.return_value = mock_strategy
+
+        before = connection.last_synced_at
+        with patch("app.integrations.celery.tasks.sync_vendor_data_task.emit_sync_completed") as emit_completed:
+            result = sync_vendor_data(str(user.id))
+
+        assert result["providers_synced"]["garmin"]["params"]["skipped"] is True
+        assert result["errors"] == {}
+        mock_strategy.workouts.load_data.assert_not_called()
+
+        emit_completed.assert_called_once()
+        assert emit_completed.call_args.kwargs["status"] == SyncStatus.SKIPPED
+        assert emit_completed.call_args.kwargs["items_processed"] == 0
+
+        db.refresh(connection)
+        assert connection.last_synced_at == before

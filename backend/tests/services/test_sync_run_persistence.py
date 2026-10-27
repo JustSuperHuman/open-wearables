@@ -1,0 +1,609 @@
+"""
+Tests for durable sync run storage.
+
+Covers the emit() hook that writes runs to Postgres: the historical-only default,
+the live opt-in, insert on start then update on terminal, and that a storage failure
+cannot break the sync it is tracking. Also covers reading runs back per user.
+"""
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from unittest.mock import MagicMock, patch
+from uuid import UUID, uuid4
+
+from sqlalchemy.orm import Session
+
+from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
+from app.models import SyncRun, SyncRunDataType
+from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+from app.schemas.data_type_coverage import CoverageSpan
+from app.schemas.enums import SeriesType
+from app.schemas.sync_status import (
+    DataTypeKind,
+    DataTypeOutcome,
+    SyncScope,
+    SyncSource,
+    SyncStage,
+    SyncStatus,
+    SyncStatusEvent,
+)
+from app.services.sync_status_service import list_stored_runs, try_persist_run, try_record_data_types
+from tests.factories import UserFactory
+
+
+def _event(user_id: UUID, **overrides: Any) -> SyncStatusEvent:
+    defaults = {
+        "run_id": f"pull_{uuid4().hex[:16]}",
+        "user_id": user_id,
+        "provider": "oura",
+        "source": SyncSource.PULL,
+        "scope": SyncScope.HISTORICAL,
+        "stage": SyncStage.STARTED,
+        "status": SyncStatus.IN_PROGRESS,
+        "started_at": datetime.now(timezone.utc),
+    }
+    return SyncStatusEvent(**{**defaults, **overrides})
+
+
+class TestTryPersistRun:
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_historical_run_is_stored(self, mock_session_local: MagicMock, db: Session) -> None:
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        event = _event(user.id)
+
+        try_persist_run(event)
+
+        run = db.query(SyncRun).filter(SyncRun.run_key == event.run_id).one()
+        assert run.scope == SyncScope.HISTORICAL
+        assert run.status == SyncStatus.IN_PROGRESS
+        assert run.ended_at is None
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_live_run_is_skipped_by_default(self, mock_session_local: MagicMock, db: Session) -> None:
+        """Live runs are one row per webhook or batch, so they are opt-in."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        event = _event(user.id, scope=SyncScope.LIVE)
+
+        try_persist_run(event)
+
+        assert db.query(SyncRun).filter(SyncRun.run_key == event.run_id).one_or_none() is None
+
+    @patch("app.services.sync_status_service.settings")
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_live_run_stored_when_opted_in(
+        self, mock_session_local: MagicMock, mock_settings: MagicMock, db: Session
+    ) -> None:
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_settings.sync_run_tracking_enabled = True
+        mock_settings.persist_live_sync_runs = True
+        user = UserFactory()
+        event = _event(user.id, scope=SyncScope.LIVE)
+
+        try_persist_run(event)
+
+        assert db.query(SyncRun).filter(SyncRun.run_key == event.run_id).one().scope == SyncScope.LIVE
+
+    @patch("app.services.sync_status_service.settings")
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_tracking_disabled_stores_nothing(
+        self, mock_session_local: MagicMock, mock_settings: MagicMock, db: Session
+    ) -> None:
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_settings.sync_run_tracking_enabled = False
+        user = UserFactory()
+        event = _event(user.id)
+
+        try_persist_run(event)
+
+        assert db.query(SyncRun).filter(SyncRun.run_key == event.run_id).one_or_none() is None
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_terminal_event_updates_the_same_row(self, mock_session_local: MagicMock, db: Session) -> None:
+        """Both events share a run_id, so the run must end up as one row."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        started_at = datetime.now(timezone.utc)
+        run_id = f"pull_{uuid4().hex[:16]}"
+
+        try_persist_run(_event(user.id, run_id=run_id, started_at=started_at))
+        try_persist_run(
+            _event(
+                user.id,
+                run_id=run_id,
+                stage=SyncStage.COMPLETED,
+                status=SyncStatus.SUCCESS,
+                started_at=started_at,
+                ended_at=started_at + timedelta(seconds=30),
+                metadata={"inserted": 120, "updated": 5},
+            )
+        )
+
+        run = db.query(SyncRun).filter(SyncRun.run_key == run_id).one()
+        assert run.status == SyncStatus.SUCCESS
+        assert run.ended_at is not None
+        assert (run.items_inserted, run.items_updated) == (120, 5)
+        # started_at describes the run's intent and must survive the update
+        assert run.started_at == started_at
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_batched_run_accumulates_counts_and_keeps_its_end(self, mock_session_local: MagicMock, db: Session) -> None:
+        """A historical SDK export reports per batch, so the run must hold the total."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        started_at = datetime.now(timezone.utc)
+        run_id = f"sdk_{uuid4().hex[:16]}"
+
+        for batch, inserted in enumerate((100, 40, 7)):
+            offset = timedelta(seconds=batch * 10)
+            try_persist_run(_event(user.id, run_id=run_id, source=SyncSource.SDK, timestamp=started_at + offset))
+            try_persist_run(
+                _event(
+                    user.id,
+                    run_id=run_id,
+                    source=SyncSource.SDK,
+                    stage=SyncStage.COMPLETED,
+                    status=SyncStatus.SUCCESS,
+                    timestamp=started_at + offset + timedelta(seconds=5),
+                    ended_at=started_at + offset + timedelta(seconds=5),
+                    metadata={"inserted": inserted},
+                )
+            )
+
+        run = db.query(SyncRun).filter(SyncRun.run_key == run_id).one()
+        assert run.items_inserted == 147
+        assert run.ended_at is not None
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_late_event_cannot_reopen_a_closed_run(self, mock_session_local: MagicMock, db: Session) -> None:
+        """A start event arriving after the terminal one must not clear the outcome."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        started_at = datetime.now(timezone.utc)
+        run_id = f"pull_{uuid4().hex[:16]}"
+
+        try_persist_run(
+            _event(
+                user.id,
+                run_id=run_id,
+                stage=SyncStage.COMPLETED,
+                status=SyncStatus.SUCCESS,
+                started_at=started_at,
+                ended_at=started_at + timedelta(seconds=30),
+                timestamp=started_at + timedelta(seconds=30),
+                metadata={"inserted": 120},
+            )
+        )
+        try_persist_run(_event(user.id, run_id=run_id, started_at=started_at, timestamp=started_at))
+
+        run = db.query(SyncRun).filter(SyncRun.run_key == run_id).one()
+        assert run.status == SyncStatus.SUCCESS
+        assert run.ended_at is not None
+        assert run.items_inserted == 120
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_storage_failure_does_not_raise(self, mock_session_local: MagicMock, db: Session) -> None:
+        """A sync must not fail because run tracking did."""
+        mock_session_local.side_effect = RuntimeError("db gone")
+
+        try_persist_run(_event(uuid4()))
+
+
+class TestTryRecordDataTypes:
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_outcomes_are_stored_against_the_run(self, mock_session_local: MagicMock, db: Session) -> None:
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        event = _event(user.id)
+        try_persist_run(event)
+
+        try_record_data_types(
+            event.run_id,
+            [
+                DataTypeOutcome(
+                    data_type="heart_rate",
+                    kind=DataTypeKind.SERIES,
+                    status=SyncStatus.SUCCESS,
+                    items_inserted=100,
+                    items_updated=3,
+                ),
+                DataTypeOutcome(
+                    data_type="spo2",
+                    kind=DataTypeKind.TASK,
+                    status=SyncStatus.FAILED,
+                    error="authorization_denied",
+                ),
+            ],
+            scope=SyncScope.HISTORICAL,
+        )
+
+        rows = {r.data_type: r for r in db.query(SyncRunDataType).all()}
+        assert rows["heart_rate"].items_inserted == 100
+        assert rows["heart_rate"].series_type == SeriesType.heart_rate
+        assert rows["spo2"].status == SyncStatus.FAILED
+        # spo2 is a provider task name, not a series type
+        assert rows["spo2"].series_type is None
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_repeated_outcomes_accumulate(self, mock_session_local: MagicMock, db: Session) -> None:
+        """Several batches of one type fold into a single row with a widening range."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        event = _event(user.id)
+        try_persist_run(event)
+
+        early = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        late = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        for covered_start, covered_end, inserted in ((late, late, 10), (early, early, 5)):
+            try_record_data_types(
+                event.run_id,
+                [
+                    DataTypeOutcome(
+                        data_type="steps",
+                        kind=DataTypeKind.SERIES,
+                        status=SyncStatus.SUCCESS,
+                        items_inserted=inserted,
+                        covered_start=covered_start,
+                        covered_end=covered_end,
+                    )
+                ],
+                scope=SyncScope.HISTORICAL,
+            )
+
+        row = db.query(SyncRunDataType).filter(SyncRunDataType.data_type == "steps").one()
+        assert row.items_inserted == 15
+        assert row.covered_start == early
+        assert row.covered_end == late
+        assert row.attempt == 2
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_late_batch_cannot_bury_a_reported_failure(self, mock_session_local: MagicMock, db: Session) -> None:
+        """An upload batch reports what it wrote, so it must not overwrite a verdict.
+
+        The SDK's log events and its upload batches write the same row and arrive in either
+        order, the batches having gone through a queue first.
+        """
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        event = _event(user.id, provider="apple", source=SyncSource.SDK)
+        try_persist_run(event)
+        ended = datetime(2026, 9, 7, 10, 3, tzinfo=timezone.utc)
+
+        # The end event for the type arrives first, carrying the failure.
+        try_record_data_types(
+            event.run_id,
+            [
+                DataTypeOutcome(
+                    data_type="sleep",
+                    kind=DataTypeKind.EVENT,
+                    status=SyncStatus.FAILED,
+                    ended_at=ended,
+                    duration_ms=8412,
+                    error_code="HKErrorAuthorizationDenied",
+                    error="Authorization denied for sleep analysis",
+                )
+            ],
+            scope=SyncScope.HISTORICAL,
+        )
+        # Then a batch that wrote a few records for it lands.
+        try_record_data_types(
+            event.run_id,
+            [
+                DataTypeOutcome(
+                    data_type="sleep",
+                    kind=DataTypeKind.EVENT,
+                    status=SyncStatus.IN_PROGRESS,
+                    items_inserted=3,
+                )
+            ],
+            scope=SyncScope.HISTORICAL,
+        )
+
+        row = db.query(SyncRunDataType).filter(SyncRunDataType.data_type == "sleep").one()
+        assert row.status == SyncStatus.FAILED
+        assert row.error_code == "HKErrorAuthorizationDenied"
+        assert row.ended_at == ended
+        assert row.duration_ms == 8412
+        # What the batch did write is still recorded against the type.
+        assert row.items_inserted == 3
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_no_run_row_means_no_op(self, mock_session_local: MagicMock, db: Session) -> None:
+        """A historical run whose parent row is missing must not create orphan rows."""
+        mock_session_local.return_value.__enter__.return_value = db
+
+        try_record_data_types(
+            "pull_does_not_exist",
+            [DataTypeOutcome(data_type="steps", kind=DataTypeKind.SERIES, status=SyncStatus.SUCCESS)],
+            scope=SyncScope.HISTORICAL,
+        )
+
+        assert db.query(SyncRunDataType).count() == 0
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_live_scope_skips_the_lookup(self, mock_session_local: MagicMock) -> None:
+        """Live runs are never stored, so their outcomes must not cost a query."""
+        try_record_data_types(
+            "pull_live",
+            [DataTypeOutcome(data_type="steps", kind=DataTypeKind.SERIES, status=SyncStatus.SUCCESS)],
+            scope=SyncScope.LIVE,
+        )
+
+        mock_session_local.assert_not_called()
+
+
+class TestCloseStaleSyncRuns:
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_only_old_in_progress_runs_are_closed(
+        self, mock_emit_session: MagicMock, mock_task_session: MagicMock, db: Session
+    ) -> None:
+        """Stale rather than failed: the run never reported what happened."""
+        mock_emit_session.return_value.__enter__.return_value = db
+        mock_task_session.return_value.__enter__.return_value = db
+        user = UserFactory()
+        old = datetime.now(timezone.utc) - timedelta(hours=48)
+
+        try_persist_run(_event(user.id, run_id="pull_stale", started_at=old, timestamp=old))
+        try_persist_run(_event(user.id, run_id="pull_recent"))
+
+        result = close_stale_sync_runs()
+
+        assert result["run_keys"] == ["pull_stale"]
+        assert db.query(SyncRun).filter(SyncRun.run_key == "pull_stale").one().status == SyncStatus.STALE
+        assert db.query(SyncRun).filter(SyncRun.run_key == "pull_recent").one().status == SyncStatus.IN_PROGRESS
+
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.last_event_at")
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_run_still_emitting_progress_is_left_open(
+        self, mock_emit_session: MagicMock, mock_task_session: MagicMock, mock_last_event: MagicMock, db: Session
+    ) -> None:
+        """A long backfill is old but alive. Progress is Redis-only, so that is where we look."""
+        mock_emit_session.return_value.__enter__.return_value = db
+        mock_task_session.return_value.__enter__.return_value = db
+        user = UserFactory()
+        old = datetime.now(timezone.utc) - timedelta(hours=48)
+        try_persist_run(_event(user.id, run_id="garmin_backfill_alive", started_at=old, timestamp=old))
+        mock_last_event.return_value = {"garmin_backfill_alive": datetime.now(timezone.utc)}
+
+        result = close_stale_sync_runs()
+
+        assert result["closed_count"] == 0
+        assert result["still_active"] == 1
+        assert db.query(SyncRun).filter(SyncRun.run_key == "garmin_backfill_alive").one().status == (
+            SyncStatus.IN_PROGRESS
+        )
+
+
+class TestListStoredRunsFilters:
+    """Filters that let a gap in the data be traced back to the run meant to cover it."""
+
+    MARCH = (datetime(2026, 3, 1, tzinfo=timezone.utc), datetime(2026, 4, 1, tzinfo=timezone.utc))
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_provider_filter(self, mock_session_local: MagicMock, db: Session) -> None:
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        try_persist_run(_event(user.id, run_id="pull_oura", provider="oura"))
+        try_persist_run(_event(user.id, run_id="pull_garmin", provider="garmin"))
+
+        runs = list_stored_runs(db, user.id, provider="garmin")
+
+        assert [r.run_key for r in runs] == ["pull_garmin"]
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_covered_range_matches_the_window_not_the_run_time(
+        self, mock_session_local: MagicMock, db: Session
+    ) -> None:
+        """Both runs executed now; only the one whose window covers March is a match."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        try_persist_run(_event(user.id, run_id="backfill_march", window_start=self.MARCH[0], window_end=self.MARCH[1]))
+        try_persist_run(
+            _event(
+                user.id,
+                run_id="backfill_january",
+                window_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                window_end=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            )
+        )
+
+        runs = list_stored_runs(
+            db,
+            user.id,
+            covered_from=datetime(2026, 3, 10, tzinfo=timezone.utc),
+            covered_to=datetime(2026, 3, 20, tzinfo=timezone.utc),
+        )
+
+        assert [r.run_key for r in runs] == ["backfill_march"]
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_run_without_any_recorded_window_is_excluded(self, mock_session_local: MagicMock, db: Session) -> None:
+        """Whether an unknown window overlaps the range is undecidable, so it is not a match."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        try_persist_run(_event(user.id, run_id="pull_no_window"))
+
+        assert list_stored_runs(db, user.id, covered_from=self.MARCH[0], covered_to=self.MARCH[1]) == []
+        assert [r.run_key for r in list_stored_runs(db, user.id)] == ["pull_no_window"]
+
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_per_data_type_covered_span_matches_without_a_run_window(
+        self, mock_session_local: MagicMock, db: Session
+    ) -> None:
+        """The per-type spans are the precise answer, and they exist when the run's window does not."""
+        mock_session_local.return_value.__enter__.return_value = db
+        user = UserFactory()
+        event = _event(user.id, run_id="sdk_batch")
+        try_persist_run(event)
+        try_record_data_types(
+            event.run_id,
+            [
+                DataTypeOutcome(
+                    data_type="heart_rate",
+                    kind=DataTypeKind.SERIES,
+                    status=SyncStatus.SUCCESS,
+                    covered_start=datetime(2026, 3, 5, tzinfo=timezone.utc),
+                    covered_end=datetime(2026, 3, 9, tzinfo=timezone.utc),
+                )
+            ],
+            scope=SyncScope.HISTORICAL,
+        )
+
+        assert [
+            r.run_key for r in list_stored_runs(db, user.id, covered_from=self.MARCH[0], covered_to=self.MARCH[1])
+        ] == ["sdk_batch"]
+        assert list_stored_runs(db, user.id, covered_to=datetime(2026, 3, 1, tzinfo=timezone.utc)) == []
+
+
+class TestDataTypeWebhooks:
+    """Per-type terminal outcomes are forwarded so a consumer learns a type's history is in."""
+
+    @staticmethod
+    def _outcome(**overrides: Any) -> DataTypeOutcome:
+        defaults = {
+            "data_type": "heart_rate",
+            "kind": DataTypeKind.SERIES,
+            "status": SyncStatus.SUCCESS,
+        }
+        return DataTypeOutcome(**{**defaults, **overrides})
+
+    def _record(self, db: Session, user_id: UUID, outcomes: list[DataTypeOutcome], run_id: str) -> MagicMock:
+        with (
+            patch("app.services.sync_status_service.SessionLocal") as session_local,
+            patch("app.services.sync_status_service.outgoing.on_sync_data_type_finished") as emit,
+        ):
+            session_local.return_value.__enter__.return_value = db
+            try_persist_run(_event(user_id, run_id=run_id))
+            try_record_data_types(run_id, outcomes, scope=SyncScope.HISTORICAL)
+        return emit
+
+    def test_terminal_outcome_is_forwarded_with_the_runs_identity(self, db: Session) -> None:
+        user = UserFactory()
+
+        emit = self._record(
+            db,
+            user.id,
+            [self._outcome(native_type="dailies", items_inserted=41230, reported_records=41230)],
+            "pull_done",
+        )
+
+        emit.assert_called_once()
+        sent = emit.call_args.kwargs
+        assert sent["run_id"] == "pull_done"
+        assert sent["provider"] == "oura"
+        assert sent["scope"] == SyncScope.HISTORICAL
+        assert sent["data_type"] == "heart_rate"
+        assert sent["native_data_type"] == "dailies"
+        assert sent["items_inserted"] == 41230
+        assert sent["succeeded"] is True
+
+    def test_two_tasks_writing_one_type_send_one_merged_outcome(self, db: Session) -> None:
+        """Oura's sleep and heart_rate tasks both write heart_rate; one wrote nothing new."""
+        user = UserFactory()
+
+        emit = self._record(
+            db,
+            user.id,
+            [
+                self._outcome(
+                    native_type="sleep",
+                    items_inserted=10,
+                    covered_start=datetime(2026, 3, 5, tzinfo=timezone.utc),
+                    covered_end=datetime(2026, 3, 6, tzinfo=timezone.utc),
+                ),
+                self._outcome(native_type="heart_rate", status=SyncStatus.SKIPPED),
+            ],
+            "pull_merged",
+        )
+
+        emit.assert_called_once()
+        sent = emit.call_args.kwargs
+        assert (sent["status"], sent["items_inserted"]) == (SyncStatus.SUCCESS, 10)
+        assert sent["covered_start"] == "2026-03-05T00:00:00+00:00"
+
+    def test_a_finished_export_reports_what_all_its_batches_wrote(self, db: Session) -> None:
+        user = UserFactory()
+        with (
+            patch("app.services.sync_status_service.SessionLocal") as session_local,
+            patch("app.services.sync_status_service.outgoing.on_sync_data_type_finished") as emit,
+        ):
+            session_local.return_value.__enter__.return_value = db
+            try_persist_run(_event(user.id, run_id="sdk_export", source=SyncSource.SDK))
+            for outcome in (
+                self._outcome(status=SyncStatus.IN_PROGRESS, items_inserted=300),
+                self._outcome(status=SyncStatus.IN_PROGRESS, items_inserted=200),
+                self._outcome(status=SyncStatus.SUCCESS),
+            ):
+                try_record_data_types("sdk_export", [outcome], scope=SyncScope.HISTORICAL)
+
+        emit.assert_called_once()
+        assert emit.call_args.kwargs["items_inserted"] == 500
+
+    def test_failed_outcome_is_forwarded_as_a_failure(self, db: Session) -> None:
+        user = UserFactory()
+
+        emit = self._record(
+            db,
+            user.id,
+            [self._outcome(status=SyncStatus.FAILED, error_code="authorization_denied", error="denied")],
+            "pull_failed",
+        )
+
+        sent = emit.call_args.kwargs
+        assert sent["succeeded"] is False
+        assert sent["error_code"] == "authorization_denied"
+
+    def test_lost_type_counts_as_a_failure_not_a_completion(self, db: Session) -> None:
+        """STALE means we lost track of it: the history promised to the consumer is not there."""
+        user = UserFactory()
+
+        emit = self._record(db, user.id, [self._outcome(status=SyncStatus.STALE)], "pull_stale")
+
+        assert emit.call_args.kwargs["succeeded"] is False
+
+    def test_in_progress_outcome_is_not_forwarded(self, db: Session) -> None:
+        """An SDK export reports its types once per batch, long before any of them is done."""
+        user = UserFactory()
+
+        emit = self._record(db, user.id, [self._outcome(status=SyncStatus.IN_PROGRESS)], "sdk_batch_1")
+
+        emit.assert_not_called()
+
+    def test_payload_carries_the_total_span_now_held_for_the_type(self, db: Session) -> None:
+        """coverage answers "is the history complete", which the run's own span cannot."""
+        user = UserFactory()
+        data_type_coverage_repository.record(
+            db,
+            [
+                CoverageSpan(
+                    user_id=user.id,
+                    provider="oura",
+                    data_type="heart_rate",
+                    kind=DataTypeKind.SERIES,
+                    start=datetime(2019, 3, 14, tzinfo=timezone.utc),
+                    end=datetime(2026, 3, 9, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        db.commit()
+
+        emit = self._record(
+            db,
+            user.id,
+            [
+                self._outcome(
+                    covered_start=datetime(2026, 3, 5, tzinfo=timezone.utc),
+                    covered_end=datetime(2026, 3, 9, tzinfo=timezone.utc),
+                )
+            ],
+            "pull_coverage",
+        )
+
+        sent = emit.call_args.kwargs
+        # What this run wrote, versus everything we now hold.
+        assert sent["covered_start"] == "2026-03-05T00:00:00+00:00"
+        assert sent["coverage_start"] == "2019-03-14T00:00:00+00:00"
+        assert sent["coverage_end"] == "2026-03-09T00:00:00+00:00"

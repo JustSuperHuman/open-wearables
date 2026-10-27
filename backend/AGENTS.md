@@ -3,7 +3,7 @@
 This file extends the root AGENTS.md with backend-specific patterns.
 
 ## Tech Stack
-- Python 3.13+
+- Python 3.14+
 - FastAPI for API framework
 - SQLAlchemy 2.0 for ORM
 - PostgreSQL for database
@@ -43,10 +43,12 @@ from app.services import ApiKeyDep, user_service
 
 router = APIRouter()
 
+
 @router.get("/users", response_model=list[UserRead])
 def list_users(db: DbSession, _api_key: ApiKeyDep):
     """List all users."""
     return db.query(user_service.crud.model).all()
+
 
 @router.post("/users", status_code=status.HTTP_201_CREATED, response_model=UserRead)
 def create_user(payload: UserCreate, db: DbSession, _api_key: ApiKeyDep):
@@ -65,6 +67,7 @@ from app.repositories.user_repository import UserRepository
 from app.schemas import UserCreate, UserCreateInternal
 from app.services.services import AppService
 
+
 class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdateInternal]):
     def __init__(self, log: Logger, **kwargs):
         super().__init__(crud_model=UserRepository, model=User, log=log, **kwargs)
@@ -73,6 +76,7 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         """Create user with server-generated id and created_at."""
         internal_creator = UserCreateInternal(**creator.model_dump())
         return super().create(db_session, internal_creator)
+
 
 # Instantiate as singleton
 user_service = UserService(log=getLogger(__name__))
@@ -87,12 +91,14 @@ from sqlalchemy import func
 from app.database import DbSession
 from app.repositories.repositories import CrudRepository
 
+
 class UserRepository(CrudRepository[User, UserCreateInternal, UserUpdateInternal]):
     def get_count_in_range(self, db: DbSession, start: datetime, end: datetime) -> int:
         return (
             db.query(func.count(self.model.id))
             .filter(self.model.created_at >= start, self.model.created_at < end)
-            .scalar() or 0
+            .scalar()
+            or 0
         )
 ```
 
@@ -104,6 +110,7 @@ from uuid import UUID
 from sqlalchemy.orm import Mapped, relationship
 from app.database import BaseDbModel
 from app.mappings import PrimaryKey, datetime_tz, str_100
+
 
 class User(BaseDbModel):
     id: Mapped[PrimaryKey[UUID]]
@@ -120,14 +127,17 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
+
 class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     created_at: datetime
     first_name: str | None = None
 
+
 class UserCreate(BaseModel):
     first_name: str | None = Field(None, max_length=100)
+
 
 class UserCreateInternal(UserCreate):
     id: UUID = Field(default_factory=uuid4)
@@ -167,12 +177,7 @@ except Exception as e:
 try:
     process_item(item)
 except Exception as e:
-    log_and_capture_error(
-        e,
-        logger,
-        f"Failed to process item {item.id}: {e}",
-        extra={"item_id": item.id, "user_id": user_id}
-    )
+    log_and_capture_error(e, logger, "Failed to process item", extra={"item_id": item.id, "user_id": user_id})
     continue
 ```
 
@@ -181,6 +186,37 @@ except Exception as e:
 - ✅ Batch processing where you want to continue despite errors
 - ✅ Multi-provider sync where one provider failure shouldn't stop others
 - ❌ Don't use if exception is re-raised or allowed to propagate naturally
+
+**Keep health data and PII out of Sentry:** `extra` is sent to Sentry as event context. Put only identifiers and categories in it (`user_id`, `provider`, `data_type`, counts, error locations) - never measurements, raw payloads or records, names or emails. The same applies to messages of exceptions you raise and to `logger.error(...)` text, since both become Sentry events. `app/integrations/sentry.py` masks known PII keys, emails and pydantic `input_value`s, but it cannot recognise a heart rate under an arbitrary key or in prose.
+
+### Logging
+
+**Default rule:** Use `log_structured` instead of raw `logger.info/warning/error/...`. Structured logs are emitted as single-line JSON, making them queryable by attribute (`@user_id:...`, `@action:...`) in Railway, GCP, Vercel, etc. This is the established standard in the codebase - prefer it even when editing an existing file that still uses the raw logger.
+
+```python
+from app.utils.structured_logging import log_structured
+
+# DON'T - unstructured, not queryable by attribute
+self.logger.warning(f"Failed to save {key} sample for user {user_id} at {recorded_at}: {e}")
+
+# DO - structured, queryable
+log_structured(
+    self.logger,
+    "warning",
+    "Failed to save activity sample",
+    provider=self.provider_name,
+    action="save_activity_sample_failed",
+    user_id=str(user_id),
+    series=key,
+    recorded_at=recorded_at,
+    error=str(e),
+)
+```
+
+- Pass the message as a stable, human-readable string and put the variable parts in `**attributes` (don't f-string them into the message).
+- `trace_id` is injected automatically from context when not supplied.
+- Output format follows `LOG_FORMAT` (`legacy` default, `json`, `text`) and `LOG_LEVEL` (see `app/utils/logging_setup.py`). Keep attribute values JSON-serializable: an unserializable value raises `TypeError` at the call site in every mode, also when `LOG_LEVEL` filters the call out.
+- For handled exceptions in background tasks you still want in Sentry, use `log_and_capture_error` (see above) rather than plain `logger.error`. Keep its `message` stable there too and pass variables via `extra` - note that `extra` becomes Sentry event context, not queryable log attributes.
 
 ### Provider Strategy Pattern
 
@@ -198,13 +234,46 @@ class GarminStrategy(BaseProviderStrategy):
         return "https://apis.garmin.com"
 ```
 
+When adding a capability to one provider, check whether other providers will need it. If so, define it on the relevant shared base (`BaseProviderStrategy`, `BaseOAuthTemplate`, `BaseWebhookService`, `BaseWorkoutsTemplate`, ...) following that base's existing convention for unsupported operations, and override it in the specific provider rather than implementing it in isolation.
+
 ## Database Migrations
+
+Schema changes use Alembic:
 
 ```bash
 make create_migration m="Add user table"  # Create
 make migrate                               # Apply
 make downgrade                             # Rollback
 ```
+
+### Resolving migration conflicts
+
+When you rebase and `main` gained a migration in the meantime, `alembic heads` shows two heads. Resolve it by moving **your** migration to the end of the chain. Never touch a migration that is already on `main`: databases that applied it treat everything inserted before it as already done and skip it silently.
+
+1. Set `down_revision` of your migration to the head from `main`.
+2. Rename your file so its date is later than the last migration on `main`. Keep the `rev` id. If your dev database already ran this migration, run `make downgrade` before re-pointing and `make migrate` after; otherwise the database keeps your revision as current and never applies the migration from `main`.
+3. CI checks the chain and fails on a second head, on a changed `down_revision` in a migration already on `main`, and on a deleted or renamed migration.
+
+### Data migrations
+
+One-off data corrections, backfills, or clean-ups that can't be expressed as a
+zero-downtime Alembic migration live in `scripts/data_migrations/`. Each must be
+idempotent and support a `--dry-run` flag, and its **module docstring is the source
+of truth** for the rationale (the problem it fixes, what it changes, and any details
+such as conflict handling) — put it there, not in the docs.
+
+A script whose idle run is expensive (it has to scan a large table to find there is nothing
+to do) runs through `data_migration_service.run`, which records a clean run in the
+`data_migration` table and skips the script afterwards. Cheap scripts stay unrecorded, so they
+keep catching rows an old pod writes during a rolling deploy.
+
+`data_type_coverage` holds the span of data we hold per user, provider and type, and only the
+write paths widen it. A script that deletes series or event rows, or moves them to another
+type, provider or user, must narrow the coverage of the keys it touched in the same
+transaction (`DataTypeCoverageRepository` has the primitives).
+
+See `docs/dev-guides/data-migrations.mdx` for how to run them and how they're wired
+into startup.
 
 ## Code Style
 - Line length: 120 characters
@@ -247,11 +316,13 @@ from sqlalchemy.orm import Mapped
 from app.database import BaseDbModel
 from app.mappings import PrimaryKey, Unique, datetime_tz, email, OneToMany, ManyToOne, FKUser
 
+
 class User(BaseDbModel):
     id: Mapped[PrimaryKey[UUID]]
     email: Mapped[Unique[email]]
     created_at: Mapped[datetime_tz]
     workouts: Mapped[OneToMany["Workout"]]
+
 
 class Workout(BaseDbModel):
     user_id: Mapped[FKUser]
@@ -272,6 +343,7 @@ Repositories handle **ONLY** database operations. Input/output must be SQLAlchem
 **CRUD repository:**
 ```python
 from app.repositories.repositories import CrudRepository
+
 
 class UserRepository(CrudRepository[User, UserCreate, UserUpdate]):
     def __init__(self, model: type[User]):
@@ -302,9 +374,11 @@ Services contain business logic. They **NEVER** perform database operations dire
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
 
+
 class UserService(AppService[UserRepository, User, UserCreate, UserUpdate]):
     def __init__(self, crud_model: type[UserRepository], model: type[User], log: Logger, **kwargs):
         super().__init__(crud_model, model, log, **kwargs)
+
 
 # Mixin pattern for additional functionality
 class ActivityMixin:
@@ -340,7 +414,8 @@ app/api/routes/
 
 **Route implementation:**
 - Use `@router.method()` decorator with HTTP method and path
-- Add `response_model` (Pydantic) and `status_code` (fastapi.status)
+- Add `response_model` (Pydantic)
+- Set `status_code` (fastapi.status) only when the success response is not 200: `HTTP_201_CREATED` for creates, `HTTP_202_ACCEPTED` for background work, `HTTP_204_NO_CONTENT` for deletes without a body. FastAPI defaults to 200, so never write `status_code=status.HTTP_200_OK`
 - Define functions as `async` by default
 - Use **kebab-case** for paths: `/heart-rate`, `/import-data`
 - Keep route code minimal, delegate to services

@@ -19,6 +19,18 @@ class HeartRateStats(BaseModel):
     min_bpm: int | None = None
 
 
+class ActivityTotals(BaseModel):
+    """The period's daily activity added up: the same days the daily summaries return."""
+
+    days: int = Field(..., description="Days with activity data, one per date after source priority", example=365)
+    steps: int = Field(..., description="Sum of daily steps", example=2841230)
+    distance_meters: float = Field(..., description="Sum of daily distance", example=2104380.5)
+    active_calories_kcal: float = Field(..., description="Sum of daily active energy", example=152340.0)
+    avg_steps: int | None = Field(
+        None, description="Mean steps over the days that report steps; null when none do", example=7784
+    )
+
+
 class ActivitySummary(BaseModel):
     date: date
     source: SourceMetadata
@@ -30,7 +42,14 @@ class ActivitySummary(BaseModel):
     elevation_meters: float | None = Field(None, description="Raw total elevation gain", example=36.0)
     # Energy metrics
     active_calories_kcal: float | None = Field(None, description="Active energy burned", example=342.5)
-    total_calories_kcal: float | None = Field(None, description="Active + basal energy", example=2150.0)
+    total_calories_kcal: float | None = Field(
+        None,
+        description=(
+            "Total energy burned: the provider's reported total when available, otherwise active + basal energy "
+            "when both are reported; null otherwise"
+        ),
+        example=2150.0,
+    )
     # Duration metrics (based on step threshold)
     active_minutes: int | None = Field(None, description="Minutes with activity above threshold", example=60)
     sedentary_minutes: int | None = Field(None, description="Minutes with minimal activity", example=480)
@@ -177,6 +196,30 @@ class RecoverySummary(BaseModel):
     sleep_duration_seconds: int | None = None
     sleep_efficiency_percent: float | None = None
     resting_heart_rate_bpm: int | None = None
-    avg_hrv_sdnn_ms: float | None = Field(None, description="Average HRV (SDNN)")
+    avg_hrv_sdnn_ms: float | None = Field(
+        None,
+        description=(
+            "Average HRV (SDNN). Currently always null: every record this endpoint returns "
+            "today comes from WHOOP - a recovery-score record is required for a row to be "
+            "returned, and only WHOOP produces one - and WHOOP reports HRV as RMSSD, which is "
+            "exposed in avg_hrv_rmssd_ms. Once recovery metrics are computed from stored "
+            "timeseries (and returned for all providers, not just WHOOP), this will carry SDNN "
+            "for providers that report it (e.g. Apple Health)."
+        ),
+    )
+    avg_hrv_rmssd_ms: float | None = Field(None, description="Average HRV (RMSSD)")
     avg_spo2_percent: float | None = None
-    recovery_score: int | None = Field(None, ge=0, le=100, description="0-100 score")
+    recovery_score: int | None = Field(
+        None,
+        ge=0,
+        le=100,
+        deprecated=True,
+        description=(
+            "Deprecated and scheduled for removal in an upcoming release: 0-100 recovery "
+            "score. Among the supported providers only WHOOP reports a recovery score, and "
+            "Open Wearables does not compute its own, so this is null for every other "
+            "provider. Migrate to the health scores endpoint "
+            "(GET /api/v1/users/{user_id}/health-scores), whose `components` array exposes "
+            "the underlying metrics the score is derived from."
+        ),
+    )

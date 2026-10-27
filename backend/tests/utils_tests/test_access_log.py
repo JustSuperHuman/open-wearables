@@ -91,3 +91,46 @@ class TestAccessLogMiddleware:
         with patch("app.middlewares.log_structured") as mock:
             client.get("/ok?limit=5&sort_by=created_at")
         assert mock.call_args_list[0].kwargs["path"] == "/ok?limit=5&sort_by=created_at"
+
+    @pytest.mark.parametrize(
+        "key",
+        ["token", "verification_token", "hub.verify_token"],
+    )
+    def test_secret_query_values_are_redacted(self, key: str) -> None:
+        # These authenticate unsigned provider webhooks, so a logged value is a
+        # usable credential — Withings' grants a forced disconnect.
+        client = _build_client(AccessLogLevel.ALL)
+        with patch("app.middlewares.log_structured") as mock:
+            client.get(f"/ok?{key}=s3cret&appli=1")
+        path = mock.call_args_list[0].kwargs["path"]
+        assert "s3cret" not in path
+        assert f"{key}=REDACTED" in path
+        assert "appli=1" in path
+
+    def test_sdk_attribution_headers_are_logged(self) -> None:
+        client = _build_client(AccessLogLevel.ALL)
+        with patch("app.middlewares.log_structured") as mock:
+            client.get(
+                "/ok",
+                headers={
+                    "X-Open-Wearables-SDK-Version": "0.15.0",
+                    "X-Open-Wearables-SDK-Platform": "ios",
+                    "X-Request-Id": "req-1",
+                    "X-Open-Wearables-Outbox-Item": "combined_item_abc",
+                    "User-Agent": "OpenWearablesHealthSDK/0.15.0 (iOS 18.1.0; iPhone15,2)",
+                },
+            )
+        attributes = mock.call_args_list[0].kwargs
+        assert attributes["sdk_version"] == "0.15.0"
+        assert attributes["sdk_platform"] == "ios"
+        assert attributes["request_id"] == "req-1"
+        assert attributes["outbox_item_id"] == "combined_item_abc"
+        assert attributes["user_agent"] == "OpenWearablesHealthSDK/0.15.0 (iOS 18.1.0; iPhone15,2)"
+
+    def test_absent_sdk_headers_add_no_fields(self) -> None:
+        client = _build_client(AccessLogLevel.ALL)
+        with patch("app.middlewares.log_structured") as mock:
+            client.get("/ok", headers={"User-Agent": ""})
+        attributes = mock.call_args_list[0].kwargs
+        for key in ("sdk_version", "sdk_platform", "request_id", "outbox_item_id", "user_agent"):
+            assert key not in attributes

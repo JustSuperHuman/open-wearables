@@ -7,7 +7,7 @@ from app.constants.workout_types.suunto import get_unified_workout_type
 from app.database import DbSession
 from app.models import DataSource
 from app.repositories.data_source_repository import DataSourceRepository
-from app.schemas.enums import ProviderName
+from app.schemas.enums import EventCategory, ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -16,7 +16,13 @@ from app.schemas.model_crud.activities import (
 from app.schemas.providers.suunto import WorkoutJSON as SuuntoWorkoutJSON
 from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
-from app.utils.dates import offset_to_iso
+from app.utils.dates import offset_to_iso, parse_iso_datetime
+
+_MAX_PAGE_SIZE = 100
+
+
+def _epoch_ms(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
 
 
 class SuuntoWorkouts(BaseWorkoutsTemplate):
@@ -43,15 +49,20 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
         end_date: datetime,
     ) -> list[Any]:
         """Get workouts from Suunto API."""
-        # Suunto uses 'since' parameter in epoch milliseconds
-        since = int(start_date.timestamp() * 1000)
-        params = {
-            "since": since,
-            "limit": 100,
-        }
-        headers = self._get_suunto_headers()
-        response = self._make_api_request(db, user_id, "/v3/workouts/", params=params, headers=headers)
-        return response.get("payload", [])
+        return self._get_all_workouts(db, user_id, since=_epoch_ms(start_date))
+
+    def _get_all_workouts(self, db: DbSession, user_id: UUID, **kwargs: Any) -> list[dict[str, Any]]:
+        """Walk every page of /v3/workouts/ from ``offset``; a short page is the last one."""
+        page_size = min(kwargs.get("limit", _MAX_PAGE_SIZE), _MAX_PAGE_SIZE)
+        offset = kwargs.get("offset", 0)
+        workouts: list[dict[str, Any]] = []
+        while True:
+            response = self.get_workouts_from_api(db, user_id, **{**kwargs, "limit": page_size, "offset": offset})
+            page = response.get("payload", [])
+            workouts.extend(page)
+            if len(page) < page_size:
+                return workouts
+            offset += page_size
 
     def get_workouts_from_api(self, db: DbSession, user_id: UUID, **kwargs: Any) -> Any:
         """Get workouts from Suunto API with specific options."""
@@ -62,7 +73,7 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
 
         params = {
             "since": since,
-            "limit": min(limit, 100),
+            "limit": min(limit, _MAX_PAGE_SIZE),
             "offset": offset,
             "filter-by-modification-time": str(filter_by_modification_time).lower(),
         }
@@ -151,9 +162,12 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
 
         workout_type = get_unified_workout_type(raw_workout.activityId)
 
-        # Fresh webhook payloads sometimes omit stopTime; approximate it from startTime + totalTime.
-        # This ignores pauses, but the periodic /v3/workouts sync overwrites with the canonical value.
-        stop_time_ms = raw_workout.stopTime or raw_workout.startTime + int(raw_workout.totalTime * 1000)
+        # Fresh webhook payloads omit stopTime, so derive it from startTime + active time + pauses.
+        # Suunto's totalTime is the active timer time (FIT total_timer_time), pauses excluded.
+        # PauseMarkerExtension carries the gaps; sum them so end_datetime reflects real elapsed time.
+        active_time_ms = int(raw_workout.totalTime * 1000)
+        pause_total_ms = sum(p.duration_ms for p in raw_workout.pause_markers)
+        stop_time_ms = raw_workout.stopTime or raw_workout.startTime + active_time_ms + pause_total_ms
         start_date, end_date = self._extract_dates(raw_workout.startTime, stop_time_ms)
         duration_seconds = int(raw_workout.totalTime)
 
@@ -161,16 +175,15 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
         if raw_workout.timeOffsetInMinutes is not None:
             zone_offset = offset_to_iso(raw_workout.timeOffsetInMinutes * 60)
 
-        # Source name: prefer displayName, then name, fallback to "Suunto"
-        if raw_workout.gear:
-            source_name = raw_workout.gear.displayName or raw_workout.gear.name or "Suunto"
+        # Newer Suunto watches (e.g. Race 2) deliver gear inside SummaryExtension instead of
+        # at the workout root; fall back to that if the top-level field is missing.
+        gear = raw_workout.gear or raw_workout.gear_from_summary_extension
+        if gear:
+            source_name = gear.displayName or gear.name or "Suunto"
+            device_model = gear.displayName or gear.name
         else:
             source_name = "Suunto"
-
-        # Device model: use display name or name from gear
-        device_model = None
-        if raw_workout.gear:
-            device_model = raw_workout.gear.displayName or raw_workout.gear.name
+            device_model = None
 
         metrics = self._build_metrics(raw_workout)
 
@@ -178,7 +191,7 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
         moving_time = duration_seconds
 
         workout_create = EventRecordCreate(
-            category="workout",
+            category=EventCategory.WORKOUT,
             type=workout_type.value,
             source_name=source_name,
             device_model=device_model,
@@ -219,32 +232,15 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
         **kwargs: Any,
     ) -> int:
         """Load data from Suunto API."""
-        # Handle generic start_date/end_date
-        start_date = kwargs.get("start_date")
-
         api_kwargs = kwargs.copy()
+        start_date = kwargs.get("start_date")
+        start_dt = start_date if isinstance(start_date, datetime) else parse_iso_datetime(start_date)
+        if start_dt:
+            api_kwargs["since"] = _epoch_ms(start_dt)
 
-        # Convert start_date to 'since' timestamp (Suunto expects epoch milliseconds)
-        if start_date:
-            if isinstance(start_date, str):
-                try:
-                    start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-                    api_kwargs["since"] = int(start_dt.timestamp() * 1000)
-                except (ValueError, AttributeError):
-                    pass
-            elif isinstance(start_date, datetime):
-                api_kwargs["since"] = int(start_date.timestamp() * 1000)
-
-        # Set Suunto-specific defaults
-        if "limit" not in api_kwargs:
-            api_kwargs["limit"] = 100
-
-        response = self.get_workouts_from_api(db, user_id, **api_kwargs)
-        workouts_data = response.get("payload", [])
-        workouts = [SuuntoWorkoutJSON(**w) for w in workouts_data]
+        workouts = [SuuntoWorkoutJSON(**w) for w in self._get_all_workouts(db, user_id, **api_kwargs)]
 
         for workout in workouts:
-            # Save device/data source info if available
             if workout.gear:
                 device_name = workout.gear.displayName or workout.gear.name
                 self.data_source_repo.ensure_data_source(
@@ -270,10 +266,18 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
         db: DbSession,
         user_id: UUID,
         workout_key: str,
+        extensions: list[str] | None = None,
     ) -> dict:
-        """Get detailed workout data from Suunto API."""
+        """Get detailed workout data from Suunto API.
+
+        `extensions` maps to the `?extensions=Foo,Bar` query parameter; requested
+        blocks land in `payload.extensions[]`.
+        """
         headers = self._get_suunto_headers()
-        return self._make_api_request(db, user_id, f"/v3/workouts/{workout_key}", headers=headers)
+        params: dict[str, str] | None = None
+        if extensions:
+            params = {"extensions": ",".join(extensions)}
+        return self._make_api_request(db, user_id, f"/v3/workouts/{workout_key}", params=params, headers=headers)
 
     def process_push_activity(self, db: DbSession, user_id: UUID, raw_workout: Any) -> UUID | None:
         """Save a single workout received via the live webhook push path.
@@ -288,14 +292,15 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
         if isinstance(raw_workout, dict):
             raw_workout = SuuntoWorkoutJSON(**raw_workout)
 
-        if raw_workout.gear:
-            device_name = raw_workout.gear.displayName or raw_workout.gear.name
+        gear = raw_workout.gear or raw_workout.gear_from_summary_extension
+        if gear:
+            device_name = gear.displayName or gear.name
             self.data_source_repo.ensure_data_source(
                 db,
                 user_id=user_id,
                 provider=ProviderName.SUUNTO,
                 device_model=device_name,
-                software_version=raw_workout.gear.swVersion,
+                software_version=gear.swVersion,
                 source=self.provider_name,
             )
 

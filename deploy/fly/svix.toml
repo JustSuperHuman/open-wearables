@@ -5,7 +5,7 @@
 #
 # First time:
 #   fly apps create open-wearables-svix
-#   fly deploy --config deploy/fly/svix.toml --image svix/svix-server:v1
+#   fly deploy --config deploy/fly/svix.toml --image svix/svix-server:v1.101.0
 #
 # Required secrets (see DEPLOY-FLY.md):
 #   SVIX_JWT_SECRET, SVIX_DB_DSN, SVIX_REDIS_DSN
@@ -13,7 +13,8 @@ app = "open-wearables-svix"
 primary_region = "iad"
 
 [build]
-  image = "svix/svix-server:v1"
+  # Same pin as docker-compose.yml (upstream #1702, alongside the svix v2 SDK upgrade).
+  image = "svix/svix-server:v1.101.0"
 
 [env]
   SVIX_QUEUE_TYPE = "redis"

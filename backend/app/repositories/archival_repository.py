@@ -3,18 +3,24 @@
 import time
 import uuid
 from datetime import date, datetime, timezone
+from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import Date, case, cast, func, text
+from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import DataPointSeries, DataPointSeriesArchive, DataSource
 from app.models.archival_setting import ArchivalSetting
+from app.models.series_type_definition import SeriesTypeDefinition
+from app.repositories.repositories import timeline_key_column, utc_bucket_start
 from app.schemas.enums import (
     AGGREGATION_METHOD_BY_TYPE,
     AggregationMethod,
+    ProviderName,
     SeriesType,
+    TimelineBucket,
+    TimelineGroupBy,
     get_series_type_from_id,
     get_series_type_id,
 )
@@ -49,6 +55,13 @@ ARCHIVE_BATCH_SIZE = 5_000
 # Safety limits to prevent overloading the DB on initial runs
 MAX_ROWS_PER_RUN = 500_000  # Stop after archiving this many rows per invocation
 MAX_SECONDS_PER_RUN = 120  # Stop after this many seconds per invocation
+
+
+class BatchedRun(NamedTuple):
+    """Rows a capped batch loop handled, and whether it got through all of them."""
+
+    rows: int
+    complete: bool
 
 
 class DataPointSeriesArchiveRepository:
@@ -133,7 +146,7 @@ class DataPointSeriesArchiveRepository:
             "total_pretty": _pretty_bytes(total),
         }
 
-    def archive_data_before(self, db: DbSession, cutoff_date: date) -> int:
+    def archive_data_before(self, db: DbSession, cutoff_date: date) -> BatchedRun:
         """Aggregate live rows older than *cutoff_date* into the archive table.
 
         For each (data_source_id, series_type_definition_id, date):
@@ -145,7 +158,7 @@ class DataPointSeriesArchiveRepository:
         to avoid overwhelming the server on the first run. The next Celery
         invocation will continue where this one left off.
 
-        Returns the number of live rows removed.
+        Returns the number of live rows removed, and whether none older are left.
         """
         total_deleted = 0
         start_time = time.monotonic()
@@ -169,7 +182,7 @@ class DataPointSeriesArchiveRepository:
             )
 
             if not source_ids:
-                break
+                return BatchedRun(total_deleted, complete=True)
 
             source_id_list = [s[0] for s in source_ids]
 
@@ -207,7 +220,7 @@ class DataPointSeriesArchiveRepository:
             )
 
             if not raw_aggregates:
-                break
+                return BatchedRun(total_deleted, complete=True)
 
             # Step 3: For each group, pick the correct aggregate column based on series type
             values_list = []
@@ -272,7 +285,7 @@ class DataPointSeriesArchiveRepository:
 
             db.commit()
 
-        return total_deleted
+        return BatchedRun(total_deleted, complete=False)
 
     def delete_archive_before(self, db: DbSession, cutoff_date: date) -> int:
         """Permanently delete archive rows older than *cutoff_date*.
@@ -290,7 +303,7 @@ class DataPointSeriesArchiveRepository:
         db.commit()
         return deleted
 
-    def delete_live_before(self, db: DbSession, cutoff_date: date) -> int:
+    def delete_live_before(self, db: DbSession, cutoff_date: date) -> BatchedRun:
         """Permanently delete live rows older than *cutoff_date*.
 
         Used when retention policy is active without archival — data is
@@ -302,7 +315,7 @@ class DataPointSeriesArchiveRepository:
 
         Respects the same safety limits as archive_data_before.
 
-        Returns the number of live rows deleted.
+        Returns the number of live rows deleted, and whether none older are left.
         """
         total_deleted = 0
         start_time = time.monotonic()
@@ -325,12 +338,99 @@ class DataPointSeriesArchiveRepository:
             )
 
             if deleted == 0:
-                break
+                return BatchedRun(total_deleted, complete=True)
 
             total_deleted += deleted
             db.commit()
 
-        return total_deleted
+        return BatchedRun(total_deleted, complete=False)
+
+    def get_user_counts_by_provider_and_type_from_archive(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+    ) -> list[tuple[str, str, int]]:
+        """Archived data point counts for a user, grouped by provider and series type.
+
+        The counterpart of ``get_user_counts_by_provider_and_type`` on the live table, which
+        once archival is enabled no longer holds anything older than the cutoff.
+
+        Returns (provider, series_type_code, count) tuples.
+        """
+        days = self._deduped_archive_days(db, user_id, _archive_range_filters(start_datetime, end_datetime))
+        rows = (
+            db.query(DataSource.provider, SeriesTypeDefinition.code, func.sum(days.c.sample_count).label("total"))
+            .select_from(days)
+            .join(DataSource, days.c.data_source_id == DataSource.id)
+            .join(SeriesTypeDefinition, days.c.series_type_definition_id == SeriesTypeDefinition.id)
+            .group_by(DataSource.provider, SeriesTypeDefinition.code)
+            .all()
+        )
+        return [(provider, code, int(total)) for provider, code, total in rows]
+
+    def get_user_timeline_counts_from_archive(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        bucket: TimelineBucket,
+        group_by: TimelineGroupBy,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+        provider: ProviderName | None = None,
+    ) -> list[tuple[str, date, int]]:
+        """Archived data point counts for a user, bucketed by time like the live timeline.
+
+        Without this an archived stretch of history renders as an empty gap, which is exactly
+        what the timeline exists to make visible.
+
+        Returns (key, bucket_start, count) for non-empty buckets only.
+        """
+        days = self._deduped_archive_days(db, user_id, _archive_range_filters(start_datetime, end_datetime))
+        bucket_start = utc_bucket_start(bucket, days.c.bucket_start_at)
+        key_column = timeline_key_column(group_by)
+
+        query = (
+            db.query(key_column, bucket_start, func.sum(days.c.sample_count).label("total"))
+            .select_from(days)
+            .join(DataSource, days.c.data_source_id == DataSource.id)
+        )
+        if group_by is TimelineGroupBy.SERIES_TYPE:
+            query = query.join(SeriesTypeDefinition, days.c.series_type_definition_id == SeriesTypeDefinition.id)
+        if provider is not None:
+            query = query.filter(DataSource.provider == provider)
+
+        rows = query.group_by(key_column, bucket_start).order_by(key_column, bucket_start).all()
+        return [(key, bucket_start_value, int(total)) for key, bucket_start_value, total in rows]
+
+    def _deduped_archive_days(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        range_filters: list[ColumnElement[bool]],
+    ) -> Subquery:
+        """One row per archived day of one user, so each day's samples are counted once.
+
+        ``aggregation_type`` is part of the archive's unique key, so a day whose series type
+        changed aggregation method has more than one row for the same samples.
+        """
+        return (
+            db.query(
+                DataPointSeriesArchive.data_source_id.label("data_source_id"),
+                DataPointSeriesArchive.series_type_definition_id.label("series_type_definition_id"),
+                DataPointSeriesArchive.bucket_start_at.label("bucket_start_at"),
+                func.max(DataPointSeriesArchive.sample_count).label("sample_count"),
+            )
+            .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id, *range_filters)
+            .group_by(
+                DataPointSeriesArchive.data_source_id,
+                DataPointSeriesArchive.series_type_definition_id,
+                DataPointSeriesArchive.bucket_start_at,
+            )
+            .subquery()
+        )
 
     def get_daily_activity_aggregates_from_archive(
         self,
@@ -346,8 +446,9 @@ class DataPointSeriesArchiveRepository:
         so the summaries service can merge both result sets.
         """
         steps_id = get_series_type_id(SeriesType.steps)
-        energy_id = get_series_type_id(SeriesType.energy)
+        energy_id = get_series_type_id(SeriesType.active_energy)
         basal_energy_id = get_series_type_id(SeriesType.basal_energy)
+        total_energy_id = get_series_type_id(SeriesType.total_energy)
         hr_id = get_series_type_id(SeriesType.heart_rate)
         distance_id = get_series_type_id(SeriesType.distance_walking_running)
         flights_id = get_series_type_id(SeriesType.flights_climbed)
@@ -372,16 +473,15 @@ class DataPointSeriesArchiveRepository:
                 DataSource.provider.label("provider"),
                 DataSource.source.label("source"),
                 DataSource.device_model.label("device_model"),
+                DataSource.device_type.label("device_type"),
                 func.sum(
                     case(
                         (DataPointSeriesArchive.series_type_definition_id == steps_id, DataPointSeriesArchive.value),
-                        else_=0,
                     )
                 ).label("steps_sum"),
                 func.sum(
                     case(
                         (DataPointSeriesArchive.series_type_definition_id == energy_id, DataPointSeriesArchive.value),
-                        else_=0,
                     )
                 ).label("active_energy_sum"),
                 func.sum(
@@ -390,9 +490,16 @@ class DataPointSeriesArchiveRepository:
                             DataPointSeriesArchive.series_type_definition_id == basal_energy_id,
                             DataPointSeriesArchive.value,
                         ),
-                        else_=0,
                     )
                 ).label("basal_energy_sum"),
+                func.sum(
+                    case(
+                        (
+                            DataPointSeriesArchive.series_type_definition_id == total_energy_id,
+                            DataPointSeriesArchive.value,
+                        ),
+                    )
+                ).label("total_energy_sum"),
                 func.avg(
                     case(
                         (DataPointSeriesArchive.series_type_definition_id == hr_id, DataPointSeriesArchive.value),
@@ -436,6 +543,7 @@ class DataPointSeriesArchiveRepository:
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
+                DataSource.device_type,
             )
             .all()
         )
@@ -448,9 +556,11 @@ class DataPointSeriesArchiveRepository:
                     "provider": row.provider,
                     "source": row.source,
                     "device_model": row.device_model,
-                    "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
-                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum else 0.0,
-                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum else 0.0,
+                    "device_type": row.device_type,
+                    "steps_sum": int(row.steps_sum) if row.steps_sum is not None else None,
+                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum is not None else None,
+                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum is not None else None,
+                    "total_energy_sum": float(row.total_energy_sum) if row.total_energy_sum is not None else None,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": None,  # Not available in simplified archive
                     "hr_min": None,  # Not available in simplified archive
@@ -467,6 +577,32 @@ class DataPointSeriesArchiveRepository:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _archive_range_filters(
+    start_datetime: datetime | None,
+    end_datetime: datetime | None,
+) -> list[ColumnElement[bool]]:
+    """Range filters for archive rows, whose bucket_start_at is always a UTC midnight.
+
+    The start is rounded down to its UTC day: an archived day is a single aggregated row
+    that cannot be split, so a window opening mid-day counts that whole day rather than
+    dropping it entirely.
+    """
+    filters: list[ColumnElement[bool]] = []
+    if start_datetime is not None:
+        filters.append(
+            DataPointSeriesArchive.bucket_start_at
+            >= _as_utc(start_datetime).replace(hour=0, minute=0, second=0, microsecond=0)
+        )
+    if end_datetime is not None:
+        filters.append(DataPointSeriesArchive.bucket_start_at < _as_utc(end_datetime))
+    return filters
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Read a naive datetime as UTC rather than as the server's local time."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def _pretty_bytes(n: int) -> str:

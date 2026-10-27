@@ -6,6 +6,7 @@ from uuid import UUID
 
 from celery import current_app as celery_app
 
+from app.constants.celery_tasks import CeleryQueue, CeleryTask
 from app.models import EventRecord, User
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -42,6 +43,7 @@ class ProviderCoverage:
     sleep_fields:           EventRecordDetail fields populated in sleep records
     menstrual_cycle_fields: EventRecordDetail fields populated in menstrual-cycle records
     health_scores:          HealthScoreCategory values produced by this provider
+    meal_fields:            EventRecordDetail fields populated in meal records
 
     Define the frozensets in the provider's coverage.py and assign here in
     strategy.py — keeps implementation files free of metadata declarations.
@@ -54,6 +56,7 @@ class ProviderCoverage:
     sleep_fields: frozenset[str] = field(default_factory=frozenset)
     menstrual_cycle_fields: frozenset[str] = field(default_factory=frozenset)
     health_scores: frozenset[HealthScoreCategory] = field(default_factory=frozenset)
+    meal_fields: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -84,9 +87,16 @@ class ProviderCapabilities:
         ``True``). Oura, Strava, Fitbit, Polar.
     webhook_registration_api:
         Provider exposes an API to programmatically register and update
-        webhook subscriptions. When ``True``, switching to webhook live-sync
-        mode triggers the ``register_provider_webhooks`` Celery task.
-        Polar, Oura, Strava.
+        webhook subscriptions. When ``True``, any live-sync mode change
+        triggers the ``reconcile_provider_webhooks`` Celery task, which
+        registers on ``webhook`` and deletes on ``pull``.
+        Polar, Oura, Strava, Withings.
+    webhook_subscription_per_user:
+        Subscriptions are created with a connection's own bearer token, so one
+        exists per active connection rather than one for the whole application.
+        Registration then fans out over connections and must also run when
+        live-sync mode is switched *off*, to revoke each one. Requires
+        ``webhook_registration_api=True``. Currently: Withings.
     webhook_inbound_secret:
         Provider signs inbound webhook payloads with HMAC; the signing
         secret is returned by the registration API (not pre-configured in
@@ -105,6 +115,7 @@ class ProviderCapabilities:
     webhook_stream: bool = False
     webhook_ping: bool = False
     webhook_registration_api: bool = False
+    webhook_subscription_per_user: bool = False
     webhook_inbound_secret: bool = False
     max_historical_days: int | None = None
 
@@ -115,6 +126,8 @@ class ProviderCapabilities:
             raise ValueError("webhook_ping requires rest_pull=True (data must be fetched via REST after the ping)")
         if self.webhook_inbound_secret and not self.webhook_registration_api:
             raise ValueError("webhook_inbound_secret requires webhook_registration_api=True")
+        if self.webhook_subscription_per_user and not self.webhook_registration_api:
+            raise ValueError("webhook_subscription_per_user requires webhook_registration_api=True")
 
 
 class BaseProviderStrategy(ABC):
@@ -183,6 +196,22 @@ class BaseProviderStrategy(ABC):
                 )
         """
 
+    def apply_live_sync_mode(self, mode: LiveSyncMode) -> None:
+        """Bring this provider's webhook subscriptions in line with a new live-sync mode.
+
+        Dispatched rather than run inline: reconciliation talks to the provider's
+        API and, for per-user providers, fans out one task per connection.
+        Override for a provider that reconciles by some other means.
+        """
+        if not self.capabilities.webhook_registration_api:
+            return
+
+        celery_app.send_task(
+            CeleryTask.RECONCILE_PROVIDER_WEBHOOKS,
+            args=[self.name, mode],
+            queue=CeleryQueue.WEBHOOK_SYNC,
+        )
+
     def start_historical_sync(self, user_id: UUID, days: int) -> HistoricalSyncResult:
         """Dispatch an async historical data sync.
 
@@ -198,7 +227,7 @@ class BaseProviderStrategy(ABC):
         start_date = end_date - timedelta(days=days)
 
         task = celery_app.send_task(
-            "app.integrations.celery.tasks.sync_vendor_data_task.sync_vendor_data",
+            CeleryTask.SYNC_VENDOR_DATA,
             kwargs={
                 "user_id": str(user_id),
                 "start_date": start_date.isoformat(),

@@ -1,25 +1,30 @@
 from __future__ import annotations
 
+import os
 import warnings
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, Literal
 from urllib.parse import quote
-
-if TYPE_CHECKING:
-    from app.schemas.enums import ProviderName
 
 from pydantic import AnyHttpUrl, Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.schemas.enums import ProviderName
+from app.schemas.enums.data_granularity import DataGranularity
 from app.utils.config_utils import (
     AccessLogLevel,
     EncryptedField,
     EnvironmentType,
     FernetDecryptorField,
+    LogFormat,
+    LogLevel,
     parse_duration,
 )
+
+# Public in .env.example and the docs, so an account still using it is open to anyone.
+DEFAULT_ADMIN_PASSWORD = "your-secure-password"
 
 
 class Settings(BaseSettings):
@@ -46,6 +51,23 @@ class Settings(BaseSettings):
 
     # None → derived in derive_access_log_level (prod: errors only, else: all)
     access_log_level: AccessLogLevel | None = None
+    # Include the 4xx response body the client received in the access log.
+    log_error_response_body: bool = False
+    log_error_response_body_max_bytes: int = 8192  # truncate a logged body
+    log_error_response_body_max_per_minute: int = 60  # cap logged bodies/min
+
+    # LOGGING SETTINGS
+    # legacy: JSON from log_structured, plain text from stdlib loggers (the output before
+    # LOG_FORMAT existed). json: every line JSON. text: every line human-readable.
+    log_format: LogFormat = LogFormat.LEGACY
+    # None keeps the per-logger defaults (stdlib INFO, log_structured unfiltered).
+    log_level: LogLevel | None = None
+    # Export logs over OTLP/HTTP as well (needs the `otel` extra). Endpoint, headers and
+    # resource come from the standard OTEL_* variables; OTEL_SDK_DISABLED=true also turns it off.
+    otel_enabled: bool = False
+    # Comma-separated attribute names, added to the built-in list, whose values are
+    # replaced with "REDACTED" in exported logs. Matching ignores case.
+    otel_export_redact_keys: str = ""
 
     # DATABASE SETTINGS
     db_host: str = "db"
@@ -60,6 +82,9 @@ class Settings(BaseSettings):
     SENTRY_SAMPLES_RATE: float = 0.5
     SENTRY_ENV: str | None = None
     SENTRY_SERVER_NAME: str | None = None
+    # Sends request bodies, stack-frame locals, log breadcrumbs and unfiltered error text to
+    # Sentry. These carry health data and PII - only for dev/staging or a Sentry you may store PHI in.
+    SENTRY_SEND_SENSITIVE_DATA: bool = False
     GIT_SHA: str | None = None
 
     # AUTH SETTINGS
@@ -81,7 +106,7 @@ class Settings(BaseSettings):
 
     # ADMIN ACCOUNT SEED
     admin_email: str = "admin@admin.com"
-    admin_password: SecretStr = SecretStr("your-secure-password")
+    admin_password: SecretStr = SecretStr(DEFAULT_ADMIN_PASSWORD)
 
     # Time to live for sleep state in Redis
     redis_sleep_ttl_seconds: int = 24 * 3600  # 24 hours
@@ -102,6 +127,13 @@ class Settings(BaseSettings):
     # Will default to false in a future release.
     historical_sync_on_connect: bool = True
 
+    # Per-request timeout for provider API calls (connect/read/write/pool alike).
+    provider_request_timeout_seconds: float = Field(30.0, gt=0, le=300)
+
+    # How long a linked-account pull lock survives without renewal. The holder renews it
+    # four times per lease from a daemon thread, so the lock dies with the worker process.
+    linked_sync_pull_lease_seconds: int = Field(120, ge=30, le=3600)
+
     # Whether to ingest per-second workout samples (speed, cadence, power, GPS, etc.) into
     # data_point_series on workout webhook arrival. Significantly increases DB storage.
     # Per-provider granularity will be added via ProviderSetting in a future release.
@@ -111,12 +143,35 @@ class Settings(BaseSettings):
     # Independent of ingest_workout_samples (DB samples) and raw_payload_storage (JSON payloads).
     store_fit_files: bool = False
 
+    # Default 24/7 data granularity (raw | hourly | daily) for providers that support it,
+    # used when a provider has no explicit ProviderSetting.data_granularity.
+    # DANGER: anything but raw halts Google Health 24/7 ingestion. Its rollUp operation is
+    # disabled (#1577), so every metric it would have driven is skipped and each sync reports
+    # the failure. Sleep and basal energy are unaffected. Leave this at raw.
+    default_data_granularity: DataGranularity = DataGranularity.RAW
+
     # SCORE SETTINGS
+    # Compute OW's own (provider="internal") sleep and resilience scores. Device-reported scores
+    # from providers are stored regardless. The fill tasks are idempotent, so re-enabling backfills the gap.
+    ow_scores_enabled: bool = True
     score_backfill_days: int = 30  # How far back the missing-score query looks
     sleep_score_interval_seconds: int = 600  # How often to run the fill-missing-scores task (default: 10 min)
     resilience_score_interval_seconds: int = (
         600  # How often to run the fill-missing-resilience-scores task (default: 10 min)
     )
+
+    # SYNC RUN TRACKING
+    sync_run_tracking_enabled: bool = True
+    # Persist live runs too. WARNING: space-consuming — one row per webhook and per SDK
+    # batch, so hundreds a day for an active user. Historical runs are a handful, ever.
+    persist_live_sync_runs: bool = False
+    # Closed as stale once this long passes with no event. Covers the gap between events,
+    # not the whole run: the sweep leaves anything still reporting in Redis alone.
+    sync_run_stale_after_hours: int = Field(2, ge=1)
+    sync_run_sweep_interval_seconds: int = Field(1800, ge=60)
+    # A user's sync.completed events within this window reach extensions as one task.
+    extension_event_debounce_seconds: int = Field(300, ge=0)
+    extension_event_sweep_interval_seconds: int = Field(60, ge=10)
 
     # API SETTINGS
     api_base_url: str = "http://localhost:8000"
@@ -148,6 +203,13 @@ class Settings(BaseSettings):
     whoop_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     whoop_default_scope: str = "offline read:cycles read:sleep read:recovery read:workout"
 
+    # SENSORBIO OAUTH SETTINGS
+    sensorbio_client_id: str | None = None
+    sensorbio_client_secret: SecretStr | None = None
+    # Sensor Bio OAuth currently has no granular scopes defined in the developer portal.
+    # Leave empty so the authorize URL omits scope= (mirrors Garmin/Suunto).
+    sensorbio_default_scope: str = ""
+
     # FITBIT OAUTH SETTINGS
     fitbit_client_id: str | None = None
     fitbit_client_secret: SecretStr | None = None
@@ -158,7 +220,7 @@ class Settings(BaseSettings):
     oura_client_id: str | None = None
     oura_client_secret: SecretStr | None = None
     oura_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
-    oura_default_scope: str = "personal daily activity heartrate workout session spo2 ring_configuration heart_health"
+    oura_default_scope: str = "personal daily heartrate workout session spo2 ring_configuration heart_health"
     oura_webhook_verification_token: SecretStr | None = None
 
     # STRAVA OAUTH SETTINGS
@@ -177,8 +239,44 @@ class Settings(BaseSettings):
     ultrahuman_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     ultrahuman_default_scope: str = "ring_data cgm_data profile"
 
-    # EMAIL SETTINGS (Resend)
+    # GOOGLE OAUTH SETTINGS
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    google_default_scope: str = (
+        "openid email "
+        "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly "
+        "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly "
+        "https://www.googleapis.com/auth/googlehealth.nutrition.readonly "
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly "
+        "https://www.googleapis.com/auth/googlehealth.settings.readonly"
+    )
+    # Bearer secret Google echoes in the Authorization header of every webhook
+    # notification. Defaults to secret_key (see derive_google_webhook_secret).
+    google_webhook_secret: SecretStr | None = None
+    # GCP project NUMBER (not ID) for Health API subscriber registration.
+    google_project_id: str | None = None
+    # Path to the service-account JSON key used to authenticate project-level
+    # subscriber registration. If unset, Application Default Credentials are used.
+    google_service_account_file: str | None = None
+    # How 24/7 data is fetched, at native resolution either way.
+    # true - reconcile, false - list; for details check docs
+    google_use_reconcile: bool = True
+    # Compatibility patch: keep emitting the pre-split /oauth/google/callback redirect URI so
+    # an upgrade needs no change to the registered OAuth client. Removed in 1.0.
+    google_legacy_oauth_path: bool = True
+
+    withings_client_id: str | None = None
+    withings_client_secret: SecretStr | None = None
+    withings_webhook_token: SecretStr | None = None
+    withings_default_scope: str = "user.info,user.metrics,user.activity"
+
+    # EMAIL SETTINGS (SMTP is used when SMTP_HOST is set, otherwise Resend)
     resend_api_key: SecretStr | None = None
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_security: Literal["starttls", "ssl", "none"] = "starttls"
     email_from_address: str | None = None
     email_from_name: str = "Open Wearables"
     frontend_url: str = "http://localhost:3000"
@@ -195,8 +293,31 @@ class Settings(BaseSettings):
     aws_region: str = "eu-north-1"
     # for topic ARN verification from SNS notification (signature is verified regardless)
     aws_sns_topic_arn: SecretStr | None = None
+    # custom S3-compatible endpoint; enables path-style + SigV4. See Apple XML import docs.
+    aws_endpoint_url: str | None = None
+    # browser-facing endpoint for presigned URLs; falls back to aws_endpoint_url
+    aws_public_endpoint_url: str | None = None
+    # upload trigger: "client" (/complete) or "sns" (S3 bucket event); only one dispatches
+    apple_xml_upload_completion_mode: Literal["client", "sns"] = "client"
+    # max XML upload size, 5 MiB - 5 TiB (default 5 GiB)
+    apple_xml_max_file_size_bytes: int = Field(
+        5 * 1024 * 1024 * 1024,
+        ge=5 * 1024 * 1024,
+        le=5 * 1024 * 1024 * 1024 * 1024,
+    )
+    # browser multipart chunk size, 5 MiB - 5 GiB (default 100 MiB)
+    apple_xml_multipart_part_size_bytes: int = Field(
+        100 * 1024 * 1024,
+        ge=5 * 1024 * 1024,
+        le=5 * 1024 * 1024 * 1024,
+    )
 
     xml_chunk_size: int = 50_000
+
+    # DATA LIFECYCLE
+    # Master switch for time-series archival and retention: the admin panel tab, the
+    # /settings/archival endpoints and the daily archival task.
+    data_lifecycle_enabled: bool = True
 
     # RAW PAYLOAD STORAGE
     raw_payload_storage: str = "disabled"  # disabled | log | s3
@@ -204,6 +325,11 @@ class Settings(BaseSettings):
     raw_payload_s3_bucket: str | None = None  # defaults to aws_bucket_name if not set
     raw_payload_s3_prefix: str = "raw-payloads"
     raw_payload_s3_endpoint_url: str | None = None  # for S3-compatible storage (e.g. Railway Object Storage)
+
+    # SDK sync enqueues an S3 reference instead of the inline body, so a backlog stops eating
+    # broker memory. Needs a bucket, not raw_payload_storage=s3 — archival is a debug aid,
+    # not a reliability dependency.
+    sdk_payload_s3_offload: bool = False
 
     # SVIX WEBHOOK SETTINGS
     # Master switch for outgoing webhooks. Off by default so deployments without Svix
@@ -214,12 +340,44 @@ class Settings(BaseSettings):
     svix_jwt_secret: SecretStr | None = None
     # Bearer token for the Svix API.  If unset, auto-generated from svix_jwt_secret at startup.
     svix_auth_token: SecretStr | None = None
+    # How long Svix keeps each message payload (health data). Svix accepts 5-90 days.
+    # Must outlast the retry schedule (~28h, up to ~66h with Retry-After): Svix silently
+    # drops a retry once the payload is gone.
+    outgoing_webhook_payload_retention_days: int = Field(7, ge=5, le=90)
+
+    # TELEMETRY SETTINGS
+    # Anonymous usage telemetry: aggregate counts and config flags only, never
+    # user data - see docs/dev-guides/telemetry.mdx for the full payload.
+    telemetry_enabled: bool = True  # also off with DO_NOT_TRACK=1
+    telemetry_endpoint_url: str = "https://telemetry.openwearables.io/api/v1/pings"
+    telemetry_beat_interval_seconds: float = 3600.0  # how often to check if a ping is due
+    telemetry_send_interval_seconds: float = 86400.0  # min gap between "daily" pings
+    telemetry_startup_debounce_seconds: float = 43200.0  # min gap before a "startup" ping
+    telemetry_usage_flush_interval_seconds: float = 30.0  # endpoint counters -> Redis
+
+    @model_validator(mode="after")
+    def honor_do_not_track(self) -> "Settings":
+        # https://donottrack.sh - the cross-tool convention, read from the environment
+        # only so it never ends up as a settings field of its own.
+        if os.environ.get("DO_NOT_TRACK", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self.telemetry_enabled = False
+        return self
 
     @model_validator(mode="after")
     def derive_access_log_level(self) -> "Settings":
         if self.access_log_level is None:
             self.access_log_level = (
                 AccessLogLevel.ERRORS if self.environment == EnvironmentType.PRODUCTION else AccessLogLevel.ALL
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_sdk_payload_s3_offload(self) -> "Settings":
+        """Fail at startup rather than degrading to inline payloads on the first request."""
+        if self.sdk_payload_s3_offload and not self.raw_payload_bucket:
+            raise ValueError(
+                "SDK_PAYLOAD_S3_OFFLOAD is on but no S3 bucket is configured - "
+                "set RAW_PAYLOAD_S3_BUCKET or AWS_BUCKET_NAME."
             )
         return self
 
@@ -250,6 +408,12 @@ class Settings(BaseSettings):
             self.oura_webhook_verification_token = SecretStr(self.secret_key)
         return self
 
+    @model_validator(mode="after")
+    def derive_google_webhook_secret(self) -> "Settings":
+        if self.google_webhook_secret is None or self.google_webhook_secret.get_secret_value() == "":
+            self.google_webhook_secret = SecretStr(self.secret_key)
+        return self
+
     @field_validator("cors_origins", mode="after")
     @classmethod
     def assemble_cors_origins(cls, v: str | list[str]) -> list[str] | str:
@@ -260,6 +424,33 @@ class Settings(BaseSettings):
 
         # This should never be reached given the type annotation, but ensures type safety
         raise ValueError(f"Unexpected type for cors_origins: {type(v)}")
+
+    @field_validator("log_format", mode="before")
+    @classmethod
+    def _parse_log_format(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.strip().lower() or LogFormat.LEGACY
+        return v
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _parse_log_level(cls, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        name = v.strip().upper()
+        # Aliases the logging module accepts, common in shared LOG_LEVEL variables.
+        name = {"WARN": "WARNING", "FATAL": "CRITICAL"}.get(name, name)
+        if not name:
+            return None
+        if name not in LogLevel.__members__:
+            # LOG_LEVEL is a common variable name; a value meant for another tool (TRACE,
+            # NOTSET, ...) must not stop the backend from starting.
+            warnings.warn(
+                f"Ignoring LOG_LEVEL={v!r}: expected DEBUG, INFO, WARNING, ERROR or CRITICAL",
+                stacklevel=2,
+            )
+            return None
+        return name
 
     @field_validator("pull_sync_lookback", mode="before")
     @classmethod
@@ -285,7 +476,22 @@ class Settings(BaseSettings):
                 stacklevel=2,
             )
             return legacy_value
-        return f"{self.api_base_url}/api/v1/oauth/{provider.value}/callback"
+        return f"{self.api_base_url}/api/v1/oauth/{self._oauth_path(provider)}/callback"
+
+    def _oauth_path(self, provider: ProviderName) -> str:
+        """Path segment to publish for a provider's OAuth routes.
+
+        Google Health was reachable at /google/ before it was split from Health Connect,
+        and that path is in every pre-0.8.1 deployment's registered redirect URI.
+        """
+        if provider is ProviderName.GOOGLE_HEALTH and self.google_legacy_oauth_path:
+            return "google"
+        return provider.value
+
+    @property
+    def raw_payload_bucket(self) -> str | None:
+        """Bucket for raw payload storage and SDK payload offload."""
+        return self.raw_payload_s3_bucket or self.aws_bucket_name
 
     @property
     def redis_url(self) -> str:
@@ -334,6 +540,9 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def _get_settings() -> Settings:
+    # Tests set this so a developer's local config/.env can't change test behaviour
+    if os.environ.get("OW_IGNORE_ENV_FILE"):
+        return Settings(_env_file=None)
     return Settings()
 
 

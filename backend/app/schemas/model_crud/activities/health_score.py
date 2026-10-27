@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.utils.dates import ZoneOffset
+from app.utils.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 
 class ScoreComponent(BaseModel):
@@ -36,7 +37,7 @@ class HealthScoreCreate(HealthScoreBase):
     user_id: UUID
     data_source_id: UUID | None = None
     provider: ProviderName
-    sleep_record_id: UUID | None = None
+    event_record_id: UUID | None = None
 
 
 class HealthScoreUpdate(HealthScoreBase): ...
@@ -48,7 +49,7 @@ class HealthScoreQueryParams(BaseModel):
     category: HealthScoreCategory | None = None
     provider: ProviderName | None = None
     data_source_id: UUID | None = None
-    limit: int = Field(50, ge=1, le=1000)
+    limit: int = Field(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
     offset: int = Field(0, ge=0)
 
     @model_validator(mode="after")
@@ -64,3 +65,6 @@ class HealthScoreResponse(HealthScoreBase):
     id: UUID
     data_source_id: UUID | None
     provider: ProviderName | None
+    event_record_id: UUID | None = Field(
+        None, description="The sleep session or workout this score describes. Null for whole-day scores."
+    )

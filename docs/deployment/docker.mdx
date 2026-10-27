@@ -1,0 +1,270 @@
+---
+title: "Deploying with Docker"
+description: "Run Open Wearables in production from the published Docker images"
+---
+
+## Published images
+
+Open Wearables publishes two production images to Docker Hub:
+
+| Image | Service | Port |
+|-------|---------|------|
+| [`themomentum/open-wearables-backend`](https://hub.docker.com/r/themomentum/open-wearables-backend) | FastAPI API + Celery worker/beat/flower | `8000` |
+| [`themomentum/open-wearables-frontend`](https://hub.docker.com/r/themomentum/open-wearables-frontend) | Developer portal (SvelteKit, served by Bun) | `3000` |
+
+The single backend image covers every backend role. The start command selects what the container runs:
+
+| Command | Role |
+|---------|------|
+| `scripts/start/app.sh` | API server. Also applies database migrations and seed scripts on startup |
+| `scripts/start/worker.sh` | Celery worker (data syncs, background jobs) |
+| `scripts/start/beat.sh` | Celery beat (scheduler) |
+| `scripts/start/flower.sh` | Flower (Celery monitoring UI, port `5555`) |
+
+Once the service is running, the start commands pass `SIGTERM` on to it, so `docker stop` shuts down cleanly. The worker container stops taking new tasks and finishes the ones already running. If that takes longer than the stop timeout (10 seconds by default), Docker kills the remaining tasks; raise `stop_grace_period` on the worker service if your syncs or imports run longer. A stop during startup, while `app.sh` applies migrations and seed scripts or `flower.sh` waits for the workers, is not passed on, so the container may keep running until the stop timeout runs out.
+
+## Image tags
+
+Both images share the same tag scheme. Choose a tag based on how much stability you need:
+
+| Tag | Points to | Use for |
+|-----|-----------|---------|
+| `latest` | The newest stable [release](https://github.com/the-momentum/open-wearables/releases) | Quick trials, and deployments that always want the current stable version |
+| `0.7.0` (exact version) | That release, immutably | **Production** - pin an exact version for repeatable, deliberate upgrades |
+| `0.7` (major.minor) | The latest patch of that minor line | Following patch releases without manually bumping the version |
+| `nightly` | The most recent build of `main` | Testing unreleased changes; **not for production** |
+| `nightly-<sha>` | A specific nightly build, immutably | Reproducing or rolling back to an exact nightly, e.g. `nightly-a0b56b8` |
+
+Tags are produced by [`.github/workflows/publish-images.yml`](https://github.com/the-momentum/open-wearables/blob/main/.github/workflows/publish-images.yml):
+
+- **Nightly** - a scheduled run at `02:00` UTC builds `main` and pushes `nightly` plus an immutable `nightly-<sha>`.
+- **Release** - publishing a [GitHub release](https://github.com/the-momentum/open-wearables/releases) builds its git tag, pushes the version tags (`0.7.0`, `0.7`), and moves `latest`. Pre-releases are published under their version tag but do not move `latest`.
+- **Manual** - the workflow can also be run by hand from the GitHub Actions UI. It requires a **tag** input and publishes that tag only - no `nightly` tags. Reserved names - `latest`, `nightly`, the whole `nightly-*` namespace, and release versions like `0.7.0`/`0.7` - are rejected, so a manual run can never move or overwrite them.
+
+For production, pin an exact version tag (e.g. `0.7.0`) rather than `latest` or `nightly`, so deployments are reproducible and upgrades are intentional.
+
+## What a deployment runs
+
+A typical deployment consists of the application containers plus their backing services:
+
+- `app` - the API, from the backend image
+- `celery-worker` - background jobs, from the backend image
+- `celery-beat` - schedules recurring syncs, from the backend image
+- `frontend` - the web UI, from the frontend image
+- PostgreSQL - primary database
+- Redis - Celery broker and cache
+- `flower` (optional) - Celery monitoring, from the backend image
+- `svix-server` (optional) - only needed when [outgoing webhooks](/api-reference/guides/webhooks) are enabled; requires its own `svix` database
+
+The backend reads all of its configuration from environment variables at runtime; `backend/config/.env.example` documents them. The frontend reads its API URL at runtime as well (see [Frontend configuration](#frontend-configuration)). Neither image needs a per-environment rebuild.
+
+<Warning>
+  The `docker-compose.yml` in the repository root is a **development** setup: it builds images from local source, hardcodes database credentials, and wires up hot reload via `docker compose watch`. Do not use it as a production template. For deployment, run the published images with your own orchestration—a Compose file you maintain, Kubernetes, or a managed platform such as [Railway](/deployment/railway).
+</Warning>
+
+## Example: Compose deployment
+
+A baseline Compose stack using the published images. It uses the `latest` tag to stay copy-pasteable; pin an exact version tag like `0.7.0` for real deployments (see [Image tags](#image-tags)).
+
+```yaml docker-compose.yml
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ${DB_NAME:-open-wearables}
+      POSTGRES_USER: ${DB_USER:-open-wearables}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  app:
+    image: themomentum/open-wearables-backend:latest
+    command: scripts/start/app.sh
+    env_file:
+      - ./.env
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  celery-worker:
+    image: themomentum/open-wearables-backend:latest
+    command: scripts/start/worker.sh
+    env_file:
+      - ./.env
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  celery-beat:
+    image: themomentum/open-wearables-backend:latest
+    command: scripts/start/beat.sh
+    env_file:
+      - ./.env
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  frontend:
+    image: themomentum/open-wearables-frontend:latest
+    environment:
+      - VITE_API_URL=${VITE_API_URL:?Set VITE_API_URL in .env}
+      - API_URL=http://app:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+### Configuration
+
+Copy `backend/config/.env.example` from the repository to `.env` next to the compose file. Compose reads the same file for variable interpolation, so `DB_PASSWORD` is defined once and shared by Postgres and the backend.
+
+The defaults in `.env.example` are development values. Override at least these for production:
+
+| Variable | Set to |
+|----------|--------|
+| `ENVIRONMENT` | `production` |
+| `DB_PASSWORD` | a strong database password |
+| `SECRET_KEY` | a long random secret, used to sign tokens |
+| `ADMIN_PASSWORD` | password for the admin account seeded on first start |
+| `CORS_ORIGINS` | your frontend origin, e.g. `["https://app.example.com"]` |
+| `FRONTEND_URL` | public URL of the frontend |
+| `API_BASE_URL` | public URL of the API, used for provider OAuth redirect URIs |
+| `VITE_API_URL` | URL of the API as reached from the browser |
+| `LOG_FORMAT` | `json` if a log collector reads the container output (see [Logs](#logs)) |
+
+`VITE_API_URL` is a frontend variable and is not part of `.env.example`—add it to the same `.env`. For a local trial of this stack, set it to `http://localhost:8000`; in production it is typically the same value as `API_BASE_URL`.
+
+Open Wearables does not use `OTEL_PROPAGATORS`, but FastAPI loads the propagators it lists at startup. If your platform sets it to one that is not installed in the image, such as `b3`, every backend container fails with `ValueError: Propagator b3 not found`. Unset it for these containers.
+
+### Mobile SDK syncs
+
+By default every mobile SDK sync payload is queued in Redis. That's fine for ongoing syncs, but a historical backfill sends a lot of data at once. How much depends on whether your app runs a backfill and how far back it goes, which you set in the SDK. With many users backfilling long periods, Redis can run out of memory. In that case we recommend setting `SDK_PAYLOAD_S3_OFFLOAD=true`. Payloads then go to an S3-compatible bucket and Redis only holds a reference. See [SDK Payload Offload](/dev-guides/raw-payload-storage#sdk-payload-offload) for the required bucket settings.
+
+### Running it
+
+<Steps>
+  <Step title="Pull the images">
+    ```bash
+    docker compose pull
+    ```
+  </Step>
+  <Step title="Start the stack">
+    ```bash
+    docker compose up -d
+    ```
+    The `app` container applies database migrations and seed scripts before the API starts.
+  </Step>
+  <Step title="Check service status">
+    ```bash
+    docker compose ps
+    ```
+    All services should report `Up`, with `db` as `Up (healthy)`.
+  </Step>
+  <Step title="Verify the API and frontend">
+    ```bash
+    curl -fsS http://localhost:8000/openapi.json > /dev/null && echo OK
+    ```
+    Prints `OK` once the API is up (migrations can take a moment on first start). Then open `http://localhost:3000` in a browser—the login page should load.
+  </Step>
+</Steps>
+
+In practice you will put the API and frontend behind a reverse proxy with TLS instead of exposing the container ports directly.
+
+To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service and a `svix` database; the development `docker-compose.yml` shows the wiring.
+
+## Logs
+
+The backend writes its application logs to stdout (in `legacy`, uvicorn's own lines go to stderr, as before). `LOG_FORMAT` selects their format:
+
+| Value | Output |
+|-------|--------|
+| `legacy` (default) | Structured app logs as JSON lines, framework and library logs as plain text (`[time - logger] (LEVEL) message`) |
+| `json` | Every line is one JSON object, for log collectors such as Loki, Datadog, CloudWatch or Azure Monitor |
+| `text` | Readable lines, for local development |
+
+Structured app log lines keep the same fields in `legacy` and `json`: `timestamp`, `level`, `message`, `provider`, then the attributes of the event (`user_id`, `action`, ...). Other lines in `json` carry `timestamp`, `level`, `message`, `logger` and, for errors, `exception`.
+
+`LOG_LEVEL` (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, case-insensitive) drops log lines below that level, structured app logs included. It cannot lower the level of libraries that are kept quieter on purpose (`httpx` and `httpcore` stay at `WARNING`). When it is not set, other logs start at `INFO` and structured app logs are not filtered.
+
+`LOG_LEVEL` also changes what Sentry sees from standard-library log records (`logger.error(...)` and similar) of app, Celery and uvicorn code: with `CRITICAL`, their errors no longer create Sentry events. Log records below `ERROR` never become Sentry breadcrumbs, whatever the level, since free-form log text can carry personal or health data (unless `SENTRY_SEND_SENSITIVE_DATA` is on, see below). Libraries with a level of their own (`httpx`, `httpcore`) still report errors to Sentry as before. `log_structured` lines never reach Sentry, whatever the level, and exceptions captured explicitly (`capture_exception`) or left unhandled always do. `WARN` and `FATAL` are accepted as aliases. Any other value, for example one your platform sets for another tool, is ignored with a warning at startup, as if `LOG_LEVEL` were not set.
+
+By default Sentry events carry no request bodies, query-string values, stack-frame local variables, emails or raw validation input, since Open Wearables handles health data. Set `SENTRY_SEND_SENSITIVE_DATA=true` to send request bodies, local variables of app code and log breadcrumbs, which makes debugging easier. Credentials (tokens, API keys, cookies, `Authorization`) stay masked. These events contain health data and personal data, so enable it only on dev/staging or when your Sentry is approved to store such data. In production, prefer [raw payload storage](/dev-guides/raw-payload-storage): Sentry errors then link to the stored payload instead of including it.
+
+<Note>
+  The default will change from `legacy` to `text` in a future release. Set `LOG_FORMAT` explicitly if you depend on the current output.
+</Note>
+
+To send logs to an OpenTelemetry collector as well, see [Exporting logs with OpenTelemetry](/dev-guides/log-export).
+
+Output printed outside the logging setup keeps its own format, and some of it goes to stderr:
+
+- startup banners of the FastAPI CLI, Celery workers and Celery beat, and Celery's `worker: Warm shutdown` lines;
+- uvicorn's first lines (`Started server process`, `Waiting for application startup.`) and, with `ENVIRONMENT=local`, its reloader messages;
+- what the start scripts print before the service starts: shell traces, Alembic migrations and the seed scripts;
+- raw payloads printed with `RAW_PAYLOAD_STORAGE=log`, which ignore `LOG_FORMAT` and `LOG_LEVEL`;
+- Python warnings (`warnings.warn`), printed to stderr.
+
+## Frontend configuration
+
+The frontend reads its configuration at runtime, so the same published image works against any backend without rebuilding:
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `VITE_API_URL` | yes | Public URL of the API, as a browser or phone reaches it. Shown in the portal wherever a client needs the API address. |
+| `API_URL` | no | A shorter route from the frontend server to the API, e.g. `http://app:8000` on the same Docker network. Defaults to `VITE_API_URL`. |
+
+```bash
+docker run -p 3000:3000 \
+  -e VITE_API_URL=https://api.client1.com \
+  themomentum/open-wearables-frontend:latest
+```
+
+### How it works
+
+The frontend is server-rendered. The browser never calls the API directly: after sign-in it holds the API tokens in an `HttpOnly` cookie, which page scripts cannot read, and the frontend server calls the API on the browser's behalf. So:
+
+- **The frontend keeps no state.** It needs no database or Redis of its own; sessions survive restarts and work across replicas.
+- **The API needs no CORS entry for the portal**, since only the frontend server talks to it.
+
+### Upgrading from the React frontend
+
+Releases before the SvelteKit portal shipped a React frontend in the same image. The image name, port `3000` and `VITE_API_URL` are unchanged, so no configuration change is needed. Optionally add `API_URL` if the API is reachable on an internal address. Developers sign in again once after the upgrade.
+
+## Related Guides
+
+- [Deploy to Railway](/deployment/railway) — One-click managed deployment
+- [Deploy to Fly.io](/deployment/fly) — Multi-service Fly deployment
+- [Raw Payloads Storage](/dev-guides/raw-payload-storage) — Backend runtime configuration example

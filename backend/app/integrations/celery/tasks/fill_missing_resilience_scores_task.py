@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 from app.algorithms.config_algorithms import resilience_config
 from app.config import settings
+from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
@@ -51,7 +52,7 @@ _MISSING_RESILIENCE_SCORES_QUERY = text("""
 """)
 
 
-@shared_task
+@shared_task(name=CeleryTask.FILL_MISSING_RESILIENCE_SCORES)
 def fill_missing_resilience_scores() -> dict[str, int]:
     """Find (user, date) pairs without an OW resilience score and calculate them.
 
@@ -63,6 +64,9 @@ def fill_missing_resilience_scores() -> dict[str, int]:
     Dates where there is insufficient HRV data remain unscored so they are
     retried on the next run once more data arrives.
     """
+    if not settings.ow_scores_enabled:
+        return {"saved": 0, "skipped": 0}
+
     with SessionLocal() as db:
         rows = db.execute(
             _MISSING_RESILIENCE_SCORES_QUERY,

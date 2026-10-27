@@ -4,8 +4,10 @@ from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
+from app.constants.entry_source import get_unified_garmin_entry_source
 from app.constants.workout_types.garmin import get_unified_workout_type
 from app.database import DbSession
+from app.schemas.enums import EventCategory
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -184,7 +186,7 @@ class GarminWorkouts(BaseWorkoutsTemplate):
 
         average_cadence = Decimal(str(raw_workout.averageCadence)) if raw_workout.averageCadence is not None else None
 
-        return {
+        metrics: EventRecordMetrics = {
             # Garmin activity payloads carry only average and max heart rate
             "heart_rate_min": None,
             "heart_rate_max": int(heart_rate_max) if heart_rate_max is not None else None,
@@ -194,6 +196,15 @@ class GarminWorkouts(BaseWorkoutsTemplate):
             "distance": distance,
             "average_cadence": average_cadence,
         }
+
+        entry_source = get_unified_garmin_entry_source(raw_workout.manual, raw_workout.isWebUpload)
+        if entry_source is not None:
+            metrics["entry_source"] = entry_source
+
+        if raw_workout.activityName:
+            metrics["label"] = raw_workout.activityName
+
+        return metrics
 
     def _normalize_workout(
         self,
@@ -218,7 +229,7 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         zone_offset = offset_to_iso(raw_workout.startTimeOffsetInSeconds)
 
         record = EventRecordCreate(
-            category="workout",
+            category=EventCategory.WORKOUT,
             type=workout_type.value,
             source_name=device_name,
             device_model=raw_workout.deviceName,

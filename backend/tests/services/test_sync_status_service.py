@@ -107,7 +107,7 @@ class TestTerminalSvixDispatch:
         user_id: str,
         mock_outgoing: dict[str, object],
     ) -> None:
-        sync_status_service.started(user_id, "garmin", SyncSource.PULL, run_id="run_a")
+        sync_status_service.emit_sync_started(user_id, "garmin", SyncSource.PULL, run_id="run_a")
         mock_outgoing["started"].assert_called_once()
 
     def test_completed_dispatches_outgoing_completed(
@@ -115,7 +115,7 @@ class TestTerminalSvixDispatch:
         user_id: str,
         mock_outgoing: dict[str, object],
     ) -> None:
-        sync_status_service.completed(user_id, "garmin", SyncSource.PULL, run_id="run_b")
+        sync_status_service.emit_sync_completed(user_id, "garmin", SyncSource.PULL, run_id="run_b")
         mock_outgoing["completed"].assert_called_once()
 
     def test_failed_dispatches_outgoing_failed(
@@ -123,7 +123,7 @@ class TestTerminalSvixDispatch:
         user_id: str,
         mock_outgoing: dict[str, object],
     ) -> None:
-        sync_status_service.failed(user_id, "garmin", SyncSource.PULL, run_id="run_c", error="boom")
+        sync_status_service.emit_sync_failed(user_id, "garmin", SyncSource.PULL, run_id="run_c", error="boom")
         mock_outgoing["failed"].assert_called_once()
 
     def test_progress_does_not_fire_outgoing_webhook(
@@ -131,7 +131,7 @@ class TestTerminalSvixDispatch:
         user_id: str,
         mock_outgoing: dict[str, object],
     ) -> None:
-        sync_status_service.progress(user_id, "garmin", SyncSource.PULL, run_id="run_d")
+        sync_status_service.emit_sync_progress(user_id, "garmin", SyncSource.PULL, run_id="run_d")
         for mock in mock_outgoing.values():
             mock.assert_not_called()
 
@@ -193,3 +193,105 @@ class TestRedisHistoryTtl:
         ttl = client.ttl(f"sync:status:user:{user_id}:recent")
         assert ttl is not None
         assert int(ttl) > 0
+
+
+class TestRunIndexIsBounded:
+    """The run index is trimmed on write and read newest-first, so it cannot grow forever."""
+
+    def test_runs_older_than_the_retention_window_are_dropped(self, user_id: str) -> None:
+        client = get_redis_client()
+        runs_key = sync_status_service._user_runs_key(user_id)
+        stale = time.time() - sync_status_service.HISTORY_TTL_SECONDS - 60
+        client.zadd(runs_key, {"pull_ancient": stale})
+
+        sync_status_service.emit(_build_event(user_id))
+
+        assert client.zscore(runs_key, "pull_ancient") is None
+        assert client.zcard(runs_key) == 1
+
+    def test_only_the_newest_runs_are_read(self, user_id: str) -> None:
+        run_ids = [sync_status_service.new_run_id() for _ in range(5)]
+        for run_id in run_ids:
+            sync_status_service.emit(_build_event(user_id, run_id=run_id))
+
+        summaries = sync_status_service.get_run_summaries(user_id, limit=2)
+
+        assert [s.run_id for s in summaries] == run_ids[-1:-3:-1]
+
+    def test_global_index_is_capped(self, user_id: str) -> None:
+        with patch.object(sync_status_service, "MAX_INDEXED_RUNS", 3):
+            for _ in range(5):
+                sync_status_service.emit(_build_event(user_id))
+
+        assert get_redis_client().zcard(sync_status_service._ALL_RUNS_KEY) == 3
+
+    def test_expired_run_keys_are_skipped(self, user_id: str) -> None:
+        """A run whose own key aged out leaves the index without breaking the read."""
+        gone = sync_status_service.new_run_id()
+        sync_status_service.emit(_build_event(user_id, run_id=gone))
+        alive = _build_event(user_id)
+        sync_status_service.emit(alive)
+        get_redis_client().delete(sync_status_service._run_key(gone))
+
+        summaries = sync_status_service.get_run_summaries(user_id)
+
+        assert [s.run_id for s in summaries] == [alive.run_id]
+
+
+class TestAllRunSummaries:
+    """The admin view reads one global index instead of scanning Redis for users."""
+
+    def test_runs_of_all_users_are_merged_newest_first(self) -> None:
+        events = [_build_event(str(uuid4())) for _ in range(3)]
+        for event in events:
+            sync_status_service.emit(event)
+            time.sleep(0.005)
+
+        summaries = sync_status_service.get_all_run_summaries(limit=2)
+
+        assert [s.run_id for s in summaries] == [events[2].run_id, events[1].run_id]
+
+    def test_does_not_scan_the_keyspace(self, user_id: str) -> None:
+        sync_status_service.emit(_build_event(user_id))
+
+        with patch.object(type(get_redis_client()), "scan", side_effect=AssertionError("SCAN used")):
+            assert len(sync_status_service.get_all_run_summaries()) == 1
+
+    def test_filters_walk_past_the_first_chunk(self, user_id: str) -> None:
+        wanted = _build_event(user_id, stage=SyncStage.COMPLETED, status=SyncStatus.SUCCESS)
+        sync_status_service.emit(wanted)
+        with patch.object(sync_status_service, "_RUN_READ_CHUNK", 2):
+            for _ in range(5):
+                sync_status_service.emit(_build_event(user_id))
+
+            summaries = sync_status_service.get_all_run_summaries(limit=1, status_filter=SyncStatus.SUCCESS.value)
+
+        assert [s.run_id for s in summaries] == [wanted.run_id]
+
+    def test_user_filter_reads_only_that_user(self, user_id: str) -> None:
+        mine = _build_event(user_id)
+        sync_status_service.emit(mine)
+        sync_status_service.emit(_build_event(str(uuid4())))
+
+        summaries = sync_status_service.get_all_run_summaries(user_id_filter=user_id)
+
+        assert [s.run_id for s in summaries] == [mine.run_id]
+
+    def test_started_at_is_recovered_for_terminal_events(self, user_id: str) -> None:
+        run_id = sync_status_service.new_run_id()
+        sync_status_service.emit_sync_started(user_id, "garmin", SyncSource.PULL, run_id=run_id)
+        sync_status_service.emit_sync_completed(user_id, "garmin", SyncSource.PULL, run_id=run_id)
+
+        [summary] = sync_status_service.get_all_run_summaries()
+
+        assert summary.stage == SyncStage.COMPLETED.value
+        assert summary.started_at is not None
+
+    def test_terminal_only_run_does_not_read_recent_events(self, user_id: str) -> None:
+        run_id = sync_status_service.new_run_id()
+        sync_status_service.emit_sync_completed(user_id, "garmin", SyncSource.WEBHOOK, run_id=run_id)
+
+        with patch.object(type(get_redis_client()), "lrange", side_effect=AssertionError("LRANGE used")):
+            [summary] = sync_status_service.get_all_run_summaries()
+
+        assert summary.started_at is None

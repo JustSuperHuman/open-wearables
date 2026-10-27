@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Annotated, Any
 from uuid import UUID
@@ -8,14 +8,11 @@ from fastapi import APIRouter, HTTPException, Path, Query, status
 
 from app.database import DbSession
 from app.integrations.celery.tasks import (
-    GARMIN_BACKFILL_DATA_TYPES,
     get_garmin_backfill_status,
-    reset_garmin_type_status,
-    set_garmin_cancel_flag,
     sync_vendor_data,
-    trigger_garmin_backfill_for_type,
 )
 from app.schemas.enums import ProviderName
+from app.schemas.responses.upload import SyncDetails, SyncQueuedResponse, SyncResponse
 from app.services import ApiKeyDep
 from app.services.providers.factory import ProviderFactory
 from app.utils.exceptions import UnsupportedProviderError
@@ -100,7 +97,7 @@ def sync_user_data(
             description="Run sync asynchronously via Celery (default: true). Set false for sync.",
         ),
     ] = True,
-) -> dict[str, bool | dict | str]:
+) -> SyncResponse | SyncQueuedResponse:
     """
     Synchronize data from fitness provider API for a specific user.
 
@@ -152,17 +149,18 @@ def sync_user_data(
             start_date_iso = summary_start_time
 
         task = _queue_pull_sync(user_id, provider.value, start_date_iso, summary_end_time)
-        return {
-            "success": True,
-            "async": True,
-            "task_id": task.id,
-            "message": f"Sync task queued for {provider.value}. Check task status for results.",
-        }
+        return SyncQueuedResponse(
+            success=True,
+            is_async=True,
+            task_id=task.id,
+            message=f"Sync task queued for {provider.value}. Check task status for results.",
+        )
 
     # Synchronous mode
     strategy = factory.get_provider(provider.value)
 
-    results: dict[str, Any] = {}
+    details = SyncDetails()
+    succeeded: list[bool] = []  # per data type, so a partial 24/7 sync isn't reported as a full success
 
     # Collect all parameters. start_date/end_date come from build_sync_params so
     # this route and the async Celery task never drift on parameter naming.
@@ -180,7 +178,8 @@ def sync_user_data(
     # Sync workouts if requested
     if data_type in (SyncDataType.WORKOUTS, SyncDataType.ALL):
         if strategy.workouts:
-            results["workouts"] = strategy.workouts.load_data(db, user_id, **params)
+            details.workouts = strategy.workouts.load_data(db, user_id, **params)
+            succeeded.append(bool(details.workouts))
         elif data_type == SyncDataType.WORKOUTS:
             raise HTTPException(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
@@ -189,28 +188,24 @@ def sync_user_data(
 
     if data_type in (SyncDataType.DATA_247, SyncDataType.ALL):
         if strategy.data_247:
-            load_fn = getattr(strategy.data_247, "load_and_save_all", None) or getattr(
-                strategy.data_247, "load_all_247_data", None
-            )
-            if load_fn is None:
-                results["data_247"] = None
-            else:
-                start_dt = datetime.fromtimestamp(since) if since else datetime.now() - timedelta(days=30)
-                end_dt = datetime.now()
-                results["data_247"] = load_fn(db, user_id, start_time=start_dt, end_time=end_dt)
+            end_dt = datetime.now(timezone.utc)
+            start_dt = datetime.fromtimestamp(since, timezone.utc) if since else end_dt - timedelta(days=30)
+            result_247 = strategy.data_247.load_and_save_all(db, user_id, start_time=start_dt, end_time=end_dt)
+            details.data_247 = result_247.summary()
+            succeeded.append(not result_247.all_failed)
         elif data_type == SyncDataType.DATA_247:
             raise HTTPException(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
                 detail=f"Provider '{provider.value}' does not support 247 data (sleep/recovery/activity)",
             )
 
-    if not results:
+    if not succeeded:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail=f"Provider '{provider.value}' does not support any requested data types",
         )
 
-    return {"success": all(results.values()), "details": results}
+    return SyncResponse(success=all(succeeded), details=details)
 
 
 # =============================================================================
@@ -218,7 +213,7 @@ def sync_user_data(
 # =============================================================================
 
 
-@router.get("/garmin/users/{user_id}/backfill/status")
+@router.get("/garmin/users/{user_id}/backfill/status", deprecated=True)
 def get_garmin_backfill_status_endpoint(
     user_id: UUID,
     _api_key: ApiKeyDep,
@@ -226,22 +221,25 @@ def get_garmin_backfill_status_endpoint(
     """
     Get Garmin backfill status for backfill data types.
 
+    **Deprecated.** Backfill progress is reported through the provider-agnostic
+    sync run endpoints (`/users/{user_id}/sync/runs`, `/users/{user_id}/sync/stream`)
+    and the `sync.started` / `sync.completed` / `sync.failed` outgoing webhooks.
+    Per-type detail will move there as well; this endpoint will be removed once
+    that lands.
+
     The backfill is webhook-based and auto-triggered after OAuth connection.
     Returns status for each data type independently. Max 30 days of history.
 
     **Response Fields:**
-    - `overall_status`: pending | in_progress | complete | cancelled | retry_in_progress | permanently_failed
+    - `overall_status`: pending | in_progress | complete | retry_in_progress
     - `current_window`: Current window index (0-based)
-    - `total_windows`: Total number of 30-day windows (12)
+    - `total_windows`: Total number of 30-day windows (1)
     - `windows`: Per-window-per-type matrix with done/pending/timed_out/failed states
     - `summary`: Per-type aggregated counts (done, timed_out, failed)
     - `in_progress`: Whether backfill is currently running (true for in_progress or retry_in_progress)
     - `retry_phase`: Whether the retry phase is currently active
     - `retry_type`: Data type currently being retried (null if not retrying)
     - `retry_window`: Window index being retried (null if not retrying)
-    - `attempt_count`: Number of GC-and-retry cycles completed
-    - `max_attempts`: Maximum GC-and-retry cycles before permanently failed (3)
-    - `permanently_failed`: Whether backfill has exhausted all retry attempts
 
     **Window Cell States:**
     - `done`: Data received via webhook or Garmin API error (treated as done)
@@ -254,73 +252,6 @@ def get_garmin_backfill_status_endpoint(
         "user_id": str(user_id),
         "provider": "garmin",
         **backfill_status,
-    }
-
-
-@router.post("/garmin/users/{user_id}/backfill/cancel")
-def cancel_garmin_backfill(
-    user_id: UUID,
-    _api_key: ApiKeyDep,
-) -> dict[str, Any]:
-    """
-    Cancel an in-progress Garmin backfill for a user.
-
-    Sets a cancellation flag in Redis. The backfill will stop after the
-    current data type completes processing.
-
-    Returns 409 if no backfill is currently in progress.
-    """
-    backfill_status = get_garmin_backfill_status(str(user_id))
-    if backfill_status["overall_status"] not in ("in_progress", "retry_in_progress"):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No backfill in progress for this user",
-        )
-
-    set_garmin_cancel_flag(str(user_id))
-
-    return {
-        "success": True,
-        "user_id": str(user_id),
-        "message": "Cancel requested. Backfill will stop after current type completes.",
-    }
-
-
-@router.post("/garmin/users/{user_id}/backfill/{type_name}/retry")
-def retry_garmin_backfill_type(
-    user_id: UUID,
-    type_name: str,
-    _api_key: ApiKeyDep,
-) -> dict[str, Any]:
-    """
-    Retry backfill for a specific data type in the current window.
-
-    Resets the type status to pending and triggers a new backfill attempt
-    for the current window context. Use when a type has timed out or
-    needs re-processing.
-
-    **Valid Type Names:**
-    sleeps, dailies, activities, activityDetails, hrv
-
-    Returns:
-        Dict with retry status
-    """
-    if type_name not in GARMIN_BACKFILL_DATA_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid type: {type_name}. Valid types: {', '.join(GARMIN_BACKFILL_DATA_TYPES)}",
-        )
-
-    # Reset the type status to pending and trigger backfill
-    reset_garmin_type_status(str(user_id), type_name)
-    trigger_garmin_backfill_for_type.delay(str(user_id), type_name)
-
-    return {
-        "success": True,
-        "user_id": str(user_id),
-        "type": type_name,
-        "status": "triggered",
-        "message": f"Retry triggered for {type_name}. Data will arrive via webhook.",
     }
 
 

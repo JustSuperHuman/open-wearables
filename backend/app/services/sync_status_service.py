@@ -18,27 +18,42 @@ Channels:
 
 Keys (all TTL'd to ``HISTORY_TTL_SECONDS``):
 - ``sync:status:user:<user_id>:recent``     — list of JSON events (LPUSH)
-- ``sync:status:user:<user_id>:runs``       — set of run_ids
+- ``sync:status:user:<user_id>:runs_by_time`` — run_ids scored by event time (ZADD)
+- ``sync:status:runs_by_time``              — the same across all users, capped at ``MAX_INDEXED_RUNS``
 - ``sync:status:run:<run_id>``              — JSON-encoded latest event
+- ``sync:status:run:<run_id>:started_at``   — ISO start time, since later events drop it
 """
 
 import logging
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
+from app.config import settings
+from app.database import DbSession, SessionLocal
+from app.extensions import events as extension_events
 from app.integrations.redis_client import get_redis_client
+from app.models import SyncRun
+from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+from app.repositories.sync_run_repository import sync_run_repository
 from app.schemas.sync_status import (
+    DataTypeOutcome,
+    SyncRunDetail,
+    SyncRunRecord,
     SyncRunSummary,
+    SyncRunWrite,
+    SyncScope,
     SyncSource,
     SyncStage,
     SyncStatus,
     SyncStatusEvent,
 )
+from app.services.outgoing_webhooks import events as outgoing
+from app.utils.context import trace_id_var
 from app.utils.sse import format_comment, format_event
 from app.utils.structured_logging import log_structured
 
@@ -62,17 +77,281 @@ def _user_recent_key(user_id: str | UUID) -> str:
     return f"sync:status:user:{user_id}:recent"
 
 
+# Run ids scored by the time of their latest event: trimmed on write and read newest-first,
+# so the index follows the retention window rather than the user's lifetime activity. The key
+# name differs from the plain set it replaces, so old set-typed keys expire unread.
+_USER_RUNS_KEY_TEMPLATE = "sync:status:user:{user_id}:runs_by_time"
+
+# Same index across all users, so the admin view reads one key instead of scanning for users.
+_ALL_RUNS_KEY = "sync:status:runs_by_time"
+MAX_INDEXED_RUNS = 10_000
+
+# Run ids fetched per round trip while walking an index for a filtered page.
+_RUN_READ_CHUNK = 200
+
+
 def _user_runs_key(user_id: str | UUID) -> str:
-    return f"sync:status:user:{user_id}:runs"
+    return _USER_RUNS_KEY_TEMPLATE.format(user_id=user_id)
 
 
 def _run_key(run_id: str) -> str:
     return f"sync:status:run:{run_id}"
 
 
+def _run_started_key(run_id: str) -> str:
+    return f"sync:status:run:{run_id}:started_at"
+
+
 def new_run_id(prefix: str = "run") -> str:
     """Allocate a fresh run identifier."""
     return f"{prefix}_{uuid4().hex[:16]}"
+
+
+_PERSISTED_STAGES = frozenset(
+    {SyncStage.STARTED, SyncStage.COMPLETED, SyncStage.FAILED, SyncStage.CANCELLED},
+)
+
+# A type we know went wrong, as opposed to one that simply ended with nothing to write.
+# STALE and UNFINISHED mean we lost track of it, which is a failure from the consumer's
+# side too: the history they were promised is not there.
+_FAILED_DATA_TYPE_STATUSES = frozenset(
+    {SyncStatus.FAILED, SyncStatus.STALE, SyncStatus.UNFINISHED, SyncStatus.CANCELLED},
+)
+
+# Metadata keys that are only the transport for a column, so they are not stored twice.
+_META_COLUMN_KEYS = frozenset({"inserted", "updated"})
+
+
+def is_persisted_scope(scope: SyncScope | str) -> bool:
+    """Whether runs of this scope are stored at all.
+
+    Historical runs always are. Live ones need persist_live_sync_runs as well, since a live
+    run is one row per webhook and per SDK batch.
+    """
+    if not settings.sync_run_tracking_enabled:
+        return False
+    return SyncScope(scope) == SyncScope.HISTORICAL or settings.persist_live_sync_runs
+
+
+class _HasStatus(Protocol):
+    @property
+    def status(self) -> SyncStatus: ...
+
+
+def run_status_from(outcomes: Iterable[_HasStatus]) -> SyncStatus:
+    """Overall status of a run, from the outcomes of its data types."""
+    match {outcome.status for outcome in outcomes}:
+        case seen if seen == {SyncStatus.SKIPPED}:
+            return SyncStatus.SKIPPED
+        case seen if seen <= {SyncStatus.SUCCESS, SyncStatus.SKIPPED}:
+            return SyncStatus.SUCCESS
+        case seen if seen <= {SyncStatus.FAILED, SyncStatus.SKIPPED}:
+            return SyncStatus.FAILED
+        case _:
+            return SyncStatus.PARTIAL
+
+
+def try_persist_run(event: SyncStatusEvent) -> None:
+    """Store the event's run in Postgres, best effort.
+
+    Only the opening and closing events are stored. Progress carries nothing durable and
+    would overwrite the run's meta with its own, so it stays in Redis, where the stale
+    sweep reads it back as a liveness signal.
+
+    Uses its own session so it never joins the caller's transaction, and swallows
+    failures: a sync must not fail because run tracking did.
+    """
+    if SyncStage(event.stage) not in _PERSISTED_STAGES or not is_persisted_scope(event.scope):
+        return
+
+    try:
+        with SessionLocal() as db:
+            sync_run_repository.upsert_run(
+                db,
+                SyncRunWrite(
+                    run_key=event.run_id,
+                    user_id=event.user_id,
+                    provider=event.provider,
+                    source=SyncSource(event.source),
+                    scope=SyncScope(event.scope),
+                    status=SyncStatus(event.status),
+                    trace_id=trace_id_var.get(),
+                    window_start=event.window_start,
+                    window_end=event.window_end,
+                    started_at=event.started_at or event.timestamp,
+                    ended_at=event.ended_at,
+                    items_inserted=event.metadata.get("inserted") or 0,
+                    items_updated=event.metadata.get("updated") or 0,
+                    error=event.error,
+                    meta={k: v for k, v in event.metadata.items() if k not in _META_COLUMN_KEYS} or None,
+                    updated_at=event.timestamp,
+                ),
+            )
+    except Exception as exc:
+        log_structured(
+            logger,
+            "warning",
+            "Failed to persist sync run",
+            provider=event.provider,
+            action="sync_run_persist_failed",
+            run_id=event.run_id,
+            user_id=str(event.user_id),
+            error=str(exc),
+        )
+
+
+def try_record_data_types(run_key: str, outcomes: list[DataTypeOutcome], *, scope: SyncScope | str) -> None:
+    """Store the per-data-type outcomes of a run, best effort.
+
+    Takes the scope so a run we never stored is skipped without a lookup.
+    """
+    if not outcomes or not is_persisted_scope(scope):
+        return
+
+    outcomes = _one_per_data_type(outcomes)
+    try:
+        with SessionLocal() as db:
+            run = sync_run_repository.get_by_run_key(db, run_key)
+            if run is None:
+                return
+            sync_run_repository.upsert_data_types(
+                db,
+                run_id=run.id,
+                outcomes=outcomes,
+                updated_at=datetime.now(timezone.utc),
+            )
+            _dispatch_data_type_webhooks(db, run, outcomes)
+    except Exception as exc:
+        log_structured(
+            logger,
+            "warning",
+            "Failed to record sync run data types",
+            action="sync_run_data_types_failed",
+            run_id=run_key,
+            error=str(exc),
+        )
+
+
+def _one_per_data_type(outcomes: list[DataTypeOutcome]) -> list[DataTypeOutcome]:
+    """Merge outcomes reporting the same data type, as two fetch tasks writing one series type do.
+
+    Stored one after another, the later verdict would replace the earlier one: a task that
+    wrote nothing would turn a type another task filled into SKIPPED.
+    """
+    by_type: dict[str, list[DataTypeOutcome]] = {}
+    for outcome in outcomes:
+        by_type.setdefault(outcome.data_type, []).append(outcome)
+    return [group[0] if len(group) == 1 else _merged(group) for group in by_type.values()]
+
+
+def _merged(group: list[DataTypeOutcome]) -> DataTypeOutcome:
+    verdicts = [o for o in group if o.status != SyncStatus.IN_PROGRESS]
+    reported = [o.reported_records for o in group if o.reported_records is not None]
+    starts = [o.covered_start for o in group if o.covered_start is not None]
+    ends = [o.covered_end for o in group if o.covered_end is not None]
+    return group[0].model_copy(
+        update={
+            "status": run_status_from(verdicts) if verdicts else SyncStatus.IN_PROGRESS,
+            "reported_records": sum(reported) if reported else None,
+            "items_inserted": sum(o.items_inserted for o in group),
+            "items_updated": sum(o.items_updated for o in group),
+            "covered_start": min(starts, default=None),
+            "covered_end": max(ends, default=None),
+            "error_code": next((o.error_code for o in group if o.error_code), None),
+            "error": next((o.error for o in group if o.error), None),
+        }
+    )
+
+
+def _dispatch_data_type_webhooks(db: DbSession, run: SyncRun, outcomes: list[DataTypeOutcome]) -> None:
+    """Forward the data types that reached a verdict, as stored for the run.
+
+    IN_PROGRESS outcomes are skipped: an SDK export reports its types once per batch long
+    before they are done, and only the log's end event knows how each one turned out.
+    The stored row is sent rather than the outcome, so the counts and span cover every
+    batch the type reported, not only the last one.
+
+    Fires per type rather than per run, so a consumer learns a type's history is in
+    without waiting for the whole backfill. The idempotency key is the run and type, so a
+    type reporting the same verdict twice is delivered once.
+    """
+    finished = [o.data_type for o in outcomes if o.status != SyncStatus.IN_PROGRESS]
+    if not finished:
+        return
+
+    rows = sync_run_repository.get_data_types(db, run.id, finished)
+    coverage = {
+        (held.data_type, held.kind): held
+        for held in data_type_coverage_repository.list_for_user(
+            db, run.user_id, provider=run.provider, data_types=finished
+        )
+    }
+
+    for row in rows:
+        held = coverage.get((row.data_type, row.kind))
+        outgoing.on_sync_data_type_finished(
+            user_id=run.user_id,
+            provider=run.provider,
+            source=str(run.source),
+            scope=str(run.scope),
+            run_id=run.run_key,
+            data_type=row.data_type,
+            kind=row.kind,
+            status=str(row.status),
+            succeeded=row.status not in _FAILED_DATA_TYPE_STATUSES,
+            native_data_type=row.native_type,
+            reported_records=row.reported_records,
+            items_inserted=row.items_inserted,
+            items_updated=row.items_updated,
+            covered_start=_iso(row.covered_start),
+            covered_end=_iso(row.covered_end),
+            coverage_start=_iso(held.coverage_start) if held else None,
+            coverage_end=_iso(held.coverage_end) if held else None,
+            error_code=row.error_code,
+            error=row.error,
+        )
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def list_stored_runs(
+    db: DbSession,
+    user_id: UUID,
+    *,
+    limit: int = 20,
+    scope: SyncScope | None = None,
+    since: datetime | None = None,
+    provider: str | None = None,
+    covered_from: datetime | None = None,
+    covered_to: datetime | None = None,
+) -> list[SyncRunRecord]:
+    """Stored runs for a user, newest first.
+
+    Reads Postgres rather than the Redis buffer, so it is not capped at 24h.
+    """
+    runs = sync_run_repository.list_for_user(
+        db,
+        user_id,
+        limit=limit,
+        scope=scope,
+        since=since,
+        provider=provider,
+        covered_from=covered_from,
+        covered_to=covered_to,
+    )
+    return [SyncRunRecord.model_validate(run) for run in runs]
+
+
+def get_stored_run(db: DbSession, run_key: str) -> SyncRunDetail | None:
+    """One stored run with its per-data-type breakdown, or None when unknown."""
+    run = sync_run_repository.get_with_data_types(db, run_key)
+    return SyncRunDetail.model_validate(run) if run is not None else None
+
+
+def _brings_new_data(event: SyncStatusEvent) -> bool:
+    return event.stage == SyncStage.COMPLETED and event.status in (SyncStatus.SUCCESS, SyncStatus.PARTIAL)
 
 
 def emit(event: SyncStatusEvent) -> None:
@@ -98,6 +377,7 @@ def emit(event: SyncStatusEvent) -> None:
             "items_total": event.items_total,
             "inserted": event.metadata.get("inserted"),
             "updated": event.metadata.get("updated"),
+            "types": event.metadata.get("types"),
             "detail": event.message,
             "error": event.error,
         }.items()
@@ -111,24 +391,38 @@ def emit(event: SyncStatusEvent) -> None:
         action="sync_status",
         status=str(event.status),
         source=str(event.source),
+        scope=str(event.scope),
         stage=str(event.stage),
         run_id=event.run_id,
         user_id=str(event.user_id),
         **extra,
     )
 
+    try_persist_run(event)
+
     try:
         client = get_redis_client()
         payload = event.model_dump_json()
         user_id = str(event.user_id)
 
+        scored_at = event.timestamp.timestamp()
+
         pipe = client.pipeline(transaction=False)
         pipe.lpush(_user_recent_key(user_id), payload)
         pipe.ltrim(_user_recent_key(user_id), 0, MAX_RECENT_EVENTS - 1)
         pipe.expire(_user_recent_key(user_id), HISTORY_TTL_SECONDS)
-        pipe.sadd(_user_runs_key(user_id), event.run_id)
+        pipe.zadd(_user_runs_key(user_id), {event.run_id: scored_at})
+        pipe.zremrangebyscore(_user_runs_key(user_id), "-inf", scored_at - HISTORY_TTL_SECONDS)
         pipe.expire(_user_runs_key(user_id), HISTORY_TTL_SECONDS)
+        pipe.zadd(_ALL_RUNS_KEY, {event.run_id: scored_at})
+        pipe.zremrangebyscore(_ALL_RUNS_KEY, "-inf", scored_at - HISTORY_TTL_SECONDS)
+        pipe.zremrangebyrank(_ALL_RUNS_KEY, 0, -(MAX_INDEXED_RUNS + 1))
+        pipe.expire(_ALL_RUNS_KEY, HISTORY_TTL_SECONDS)
         pipe.set(_run_key(event.run_id), payload, ex=HISTORY_TTL_SECONDS)
+        if event.stage == SyncStage.STARTED and event.started_at is not None:
+            pipe.set(_run_started_key(event.run_id), event.started_at.isoformat(), ex=HISTORY_TTL_SECONDS, nx=True)
+        if _brings_new_data(event) and extension_events.subscribed(extension_events.SYNC_COMPLETED):
+            extension_events.record(pipe, extension_events.SYNC_COMPLETED, user_id)
         pipe.publish(_user_channel(user_id), payload)
         pipe.publish(_global_channel(), payload)
         pipe.execute()
@@ -151,9 +445,6 @@ def _maybe_dispatch_outgoing_webhook(event: SyncStatusEvent) -> None:
     avoid spamming subscribers with intermediate progress updates.
     """
     try:
-        # Imported lazily to avoid circular imports between services.
-        from app.services.outgoing_webhooks import events as outgoing
-
         stage = event.stage if isinstance(event.stage, str) else event.stage.value
         status = event.status if isinstance(event.status, str) else event.status.value
         source = event.source if isinstance(event.source, str) else event.source.value
@@ -199,6 +490,7 @@ def emit_event(
     source: SyncSource | str,
     stage: SyncStage | str,
     status: SyncStatus | str,
+    scope: SyncScope | str = SyncScope.LIVE,
     run_id: str | None = None,
     message: str | None = None,
     progress: float | None = None,
@@ -207,6 +499,8 @@ def emit_event(
     error: str | None = None,
     primary_user_id: UUID | None = None,
     metadata: dict[str, Any] | None = None,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
     started_at: datetime | None = None,
     ended_at: datetime | None = None,
 ) -> SyncStatusEvent:
@@ -216,6 +510,7 @@ def emit_event(
         user_id=user_id if isinstance(user_id, UUID) else UUID(str(user_id)),
         provider=provider,
         source=SyncSource(source) if not isinstance(source, SyncSource) else source,
+        scope=SyncScope(scope) if not isinstance(scope, SyncScope) else scope,
         stage=SyncStage(stage) if not isinstance(stage, SyncStage) else stage,
         status=SyncStatus(status) if not isinstance(status, SyncStatus) else status,
         message=message,
@@ -225,11 +520,47 @@ def emit_event(
         error=error,
         primary_user_id=primary_user_id,
         metadata=metadata or {},
+        window_start=window_start,
+        window_end=window_end,
         started_at=started_at,
         ended_at=ended_at,
     )
     emit(event)
     return event
+
+
+def last_event_at(run_ids: list[str]) -> dict[str, datetime] | None:
+    """When each run last emitted anything, according to Redis.
+
+    Runs missing from the result either never emitted or fell out of the 24h window.
+    Returns None when Redis could not be read, which is not the same as nothing being
+    alive: the caller must skip the sweep rather than close every candidate.
+    """
+    if not run_ids:
+        return {}
+
+    try:
+        client = get_redis_client()
+        pipe = client.pipeline(transaction=False)
+        for run_id in run_ids:
+            pipe.get(_run_key(run_id))
+
+        seen: dict[str, datetime] = {}
+        for run_id, raw in zip(run_ids, pipe.execute()):
+            if not raw:
+                continue
+            with suppress(ValueError, TypeError):
+                seen[run_id] = SyncStatusEvent.model_validate_json(raw).timestamp
+        return seen
+    except Exception as exc:
+        log_structured(
+            logger,
+            "warning",
+            "Failed to read sync run liveness",
+            action="sync_run_liveness_failed",
+            error=str(exc),
+        )
+        return None
 
 
 def get_recent_events(user_id: str | UUID, limit: int = 50) -> list[SyncStatusEvent]:
@@ -245,63 +576,11 @@ def get_recent_events(user_id: str | UUID, limit: int = 50) -> list[SyncStatusEv
 def get_run_summaries(user_id: str | UUID, limit: int = 20) -> list[SyncRunSummary]:
     """Aggregate recent events into per-run summaries (newest first).
 
-    Reads the per-user runs set to discover all known run IDs, then fetches
-    the latest event for each run from its dedicated hash key.  This avoids
-    the hard ceiling imposed by reading only the capped recent-events list
-    (``MAX_RECENT_EVENTS`` raw events / ~4 events-per-run ≈ 50 runs max).
-
-    Terminal events (completed / failed / cancelled) don't carry
-    ``started_at``; we recover it by scanning the recent-events list once
-    and building a run → started_at lookup so duration can be calculated.
+    Reads the newest ``limit`` run ids from the per-user runs index, then fetches the latest
+    event of each from its own key. Cost follows the page asked for rather than everything
+    the user has ever synced, and it is not capped by the recent-events list.
     """
-    client = get_redis_client()
-
-    raw_run_ids: set[str | bytes] = client.smembers(_user_runs_key(user_id))
-    if not raw_run_ids:
-        return []
-
-    run_ids = [r if isinstance(r, str) else r.decode("utf-8") for r in raw_run_ids]
-
-    # Build started_at lookup from the recent-events list.  Terminal events
-    # don't carry started_at, so we need this to compute run duration.
-    started_at_by_run: dict[str, datetime] = {}
-    for evt in get_recent_events(user_id, limit=MAX_RECENT_EVENTS):
-        if evt.started_at is not None and evt.run_id not in started_at_by_run:
-            started_at_by_run[evt.run_id] = evt.started_at
-
-    pipe = client.pipeline(transaction=False)
-    for rid in run_ids:
-        pipe.get(_run_key(rid))
-    raw_events = pipe.execute()
-
-    summaries: list[SyncRunSummary] = []
-    for item in raw_events:
-        if not item:
-            continue
-        with suppress(ValueError, TypeError):
-            event = SyncStatusEvent.model_validate_json(item)
-            summaries.append(
-                SyncRunSummary(
-                    run_id=event.run_id,
-                    user_id=event.user_id,
-                    provider=event.provider,
-                    source=str(event.source),
-                    stage=str(event.stage),
-                    status=str(event.status),
-                    message=event.message,
-                    progress=event.progress,
-                    items_processed=event.items_processed,
-                    items_total=event.items_total,
-                    error=event.error,
-                    started_at=event.started_at or started_at_by_run.get(event.run_id),
-                    ended_at=event.ended_at,
-                    primary_user_id=event.primary_user_id,
-                    last_update=event.timestamp,
-                )
-            )
-
-    summaries.sort(key=lambda s: s.last_update, reverse=True)
-    return summaries[:limit]
+    return _read_run_summaries(_user_runs_key(user_id), limit)
 
 
 def get_all_run_summaries(
@@ -311,42 +590,87 @@ def get_all_run_summaries(
     status_filter: str | None = None,
     source_filter: str | None = None,
 ) -> list[SyncRunSummary]:
-    """Aggregate run summaries across all users (for admin view).
+    """Run summaries across all users, newest first (for admin view).
 
-    Uses SCAN to discover users with recent sync data, then merges their
-    per-run summaries. Optional filters narrow results before sorting.
+    Walks the global runs index, or the user's own one when filtered by user, until
+    ``limit`` runs pass the filters. Cost follows the page and the filters' selectivity,
+    not the number of users; the global index holds at most ``MAX_INDEXED_RUNS``.
     """
+    index_key = _user_runs_key(user_id_filter) if user_id_filter else _ALL_RUNS_KEY
+    if not (provider_filter or status_filter or source_filter):
+        return _read_run_summaries(index_key, limit)
+
+    def matches(event: SyncStatusEvent) -> bool:
+        return (
+            (not provider_filter or event.provider == provider_filter)
+            and (not status_filter or str(event.status) == status_filter)
+            and (not source_filter or str(event.source) == source_filter)
+        )
+
+    return _read_run_summaries(index_key, limit, matches)
+
+
+def _read_run_summaries(
+    index_key: str,
+    limit: int,
+    matches: Callable[[SyncStatusEvent], bool] | None = None,
+) -> list[SyncRunSummary]:
+    """Latest event of the newest ``limit`` runs in an index that pass ``matches``."""
     client = get_redis_client()
+    chunk = limit if matches is None else max(limit, _RUN_READ_CHUNK)
 
-    if user_id_filter:
-        user_ids = [str(user_id_filter)]
-    else:
-        pattern = "sync:status:user:*:runs"
-        user_ids = []
-        cursor: int = 0
-        while True:
-            cursor, keys = client.scan(cursor=cursor, match=pattern, count=200)
-            for key in keys:
-                k = key if isinstance(key, str) else key.decode("utf-8")
-                parts = k.split(":")
-                if len(parts) >= 4:
-                    user_ids.append(parts[3])
-            if cursor == 0:
-                break
+    events: list[SyncStatusEvent] = []
+    offset = 0
+    while len(events) < limit:
+        run_ids = cast(list[str], client.zrevrange(index_key, offset, offset + chunk - 1))
+        if not run_ids:
+            break
+        offset += len(run_ids)
 
-    all_summaries: list[SyncRunSummary] = []
-    for uid in user_ids:
-        all_summaries.extend(get_run_summaries(uid, limit=MAX_RECENT_EVENTS))
+        for item in cast(list[str | None], client.mget([_run_key(rid) for rid in run_ids])):
+            if not item:
+                continue
+            with suppress(ValueError, TypeError):
+                event = SyncStatusEvent.model_validate_json(item)
+                if matches is None or matches(event):
+                    events.append(event)
 
-    if provider_filter:
-        all_summaries = [s for s in all_summaries if s.provider == provider_filter]
-    if status_filter:
-        all_summaries = [s for s in all_summaries if s.status == status_filter]
-    if source_filter:
-        all_summaries = [s for s in all_summaries if s.source == source_filter]
+        if len(run_ids) < chunk:
+            break
 
-    all_summaries.sort(key=lambda s: s.last_update, reverse=True)
-    return all_summaries[:limit]
+    events = events[:limit]
+    started_at_by_run = _started_at_by_run([e.run_id for e in events if e.started_at is None])
+
+    summaries = [
+        SyncRunSummary(
+            run_id=event.run_id,
+            user_id=event.user_id,
+            provider=event.provider,
+            source=str(event.source),
+            stage=str(event.stage),
+            status=str(event.status),
+            message=event.message,
+            progress=event.progress,
+            items_processed=event.items_processed,
+            items_total=event.items_total,
+            error=event.error,
+            started_at=event.started_at or started_at_by_run.get(event.run_id),
+            ended_at=event.ended_at,
+            primary_user_id=event.primary_user_id,
+            last_update=event.timestamp,
+        )
+        for event in events
+    ]
+    summaries.sort(key=lambda s: s.last_update, reverse=True)
+    return summaries
+
+
+def _started_at_by_run(run_ids: list[str]) -> dict[str, datetime]:
+    """When each run started, for later events that no longer carry it."""
+    if not run_ids:
+        return {}
+    values = cast(list[str | None], get_redis_client().mget([_run_started_key(rid) for rid in run_ids]))
+    return {rid: datetime.fromisoformat(value) for rid, value in zip(run_ids, values) if value}
 
 
 def stream_user_events(
@@ -409,32 +733,42 @@ def stream_user_events(
 # ---------------------------------------------------------------------------
 
 
-def started(
+def emit_sync_started(
     user_id: str | UUID,
     provider: str,
     source: SyncSource | str,
     *,
+    scope: SyncScope | str = SyncScope.LIVE,
     run_id: str | None = None,
     message: str | None = None,
     primary_user_id: UUID | None = None,
     metadata: dict[str, Any] | None = None,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> SyncStatusEvent:
-    """Emit a STARTED / IN_PROGRESS event."""
+    """Open a sync run: emits the first event, stamping started_at as now.
+
+    Callers pass run_id to group every later event of the same run under it. Omitting it
+    allocates a fresh one, which only makes sense for a run that emits nothing else.
+    """
     return emit_event(
         user_id=user_id,
         provider=provider,
         source=source,
+        scope=scope,
         stage=SyncStage.STARTED,
         status=SyncStatus.IN_PROGRESS,
         run_id=run_id,
         message=message,
         primary_user_id=primary_user_id,
         metadata=metadata,
+        window_start=window_start,
+        window_end=window_end,
         started_at=datetime.now(timezone.utc),
     )
 
 
-def progress(
+def emit_sync_progress(
     user_id: str | UUID,
     provider: str,
     source: SyncSource | str,
@@ -447,7 +781,14 @@ def progress(
     items_total: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> SyncStatusEvent:
-    """Emit a progress update."""
+    """Report mid-run progress without changing the run's outcome.
+
+    Status stays IN_PROGRESS; only stage, counts and the 0..1 progress value move.
+
+    Takes no scope, so progress never reaches Postgres: it is our highest-frequency event
+    and carries nothing durable, since the terminal event has the final counts. Redis keeps
+    it for 24h, which the stale sweep reads back as a liveness signal.
+    """
     return emit_event(
         user_id=user_id,
         provider=provider,
@@ -463,23 +804,31 @@ def progress(
     )
 
 
-def completed(
+def emit_sync_completed(
     user_id: str | UUID,
     provider: str,
     source: SyncSource | str,
     *,
     run_id: str,
+    scope: SyncScope | str = SyncScope.LIVE,
     status: SyncStatus | str = SyncStatus.SUCCESS,
     message: str | None = None,
     items_processed: int | None = None,
     primary_user_id: UUID | None = None,
     metadata: dict[str, Any] | None = None,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> SyncStatusEvent:
-    """Emit a COMPLETED terminal event."""
+    """Close a sync run that finished, stamping ended_at as now.
+
+    Finished is not the same as succeeded: pass status=PARTIAL when some types failed,
+    or SKIPPED when the run was a no-op. FAILED belongs on emit_sync_failed instead.
+    """
     return emit_event(
         user_id=user_id,
         provider=provider,
         source=source,
+        scope=scope,
         stage=SyncStage.COMPLETED,
         status=status,
         run_id=run_id,
@@ -488,49 +837,65 @@ def completed(
         primary_user_id=primary_user_id,
         progress=1.0,
         metadata=metadata,
+        window_start=window_start,
+        window_end=window_end,
         ended_at=datetime.now(timezone.utc),
     )
 
 
-def failed(
+def emit_sync_failed(
     user_id: str | UUID,
     provider: str,
     source: SyncSource | str,
     *,
     run_id: str,
     error: str,
+    scope: SyncScope | str = SyncScope.LIVE,
     message: str | None = None,
+    primary_user_id: UUID | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> SyncStatusEvent:
-    """Emit a FAILED terminal event."""
+    """Close a sync run that raised, stamping ended_at as now.
+
+    For a run that ended without ever reporting an outcome, leave it open and let the
+    stale-run sweep close it as STALE. Failed means we know it failed.
+    """
     return emit_event(
         user_id=user_id,
         provider=provider,
         source=source,
+        scope=scope,
         stage=SyncStage.FAILED,
         status=SyncStatus.FAILED,
         run_id=run_id,
         error=error,
         message=message,
+        primary_user_id=primary_user_id,
         metadata=metadata,
         ended_at=datetime.now(timezone.utc),
     )
 
 
-def cancelled(
+def emit_sync_cancelled(
     user_id: str | UUID,
     provider: str,
     source: SyncSource | str,
     *,
     run_id: str,
+    scope: SyncScope | str = SyncScope.LIVE,
     message: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> SyncStatusEvent:
-    """Emit a CANCELLED terminal event."""
+    """Close a sync run that was deliberately stopped before finishing.
+
+    Cancelled is a reported outcome, unlike the STALE the sweep assigns: we know
+    the run stopped and why.
+    """
     return emit_event(
         user_id=user_id,
         provider=provider,
         source=source,
+        scope=scope,
         stage=SyncStage.CANCELLED,
         status=SyncStatus.CANCELLED,
         run_id=run_id,
@@ -540,7 +905,7 @@ def cancelled(
     )
 
 
-def webhook_delivered(
+def emit_webhook_delivered(
     user_id: str | UUID,
     provider: str,
     *,

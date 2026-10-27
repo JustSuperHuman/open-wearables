@@ -1,17 +1,28 @@
-from celery import current_app as celery_app
-
-from app.config import settings
 from app.database import DbSession
+from app.models import ProviderSetting
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
-from app.schemas.auth.live_sync_mode import LiveSyncMode
+from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.data_priority import (
     ProviderSettingRead,
     ProviderSettingUpdate,
 )
+from app.services.providers.base_strategy import ProviderCapabilities
 from app.services.providers.factory import ProviderFactory
 
-_REGISTER_WEBHOOKS_TASK = "app.integrations.celery.tasks.register_provider_webhooks_task.register_provider_webhooks"
+_NON_PROVIDER_NAMES = {ProviderName.UNKNOWN, ProviderName.INTERNAL}
+
+
+def live_sync_mode_of(provider: str, provider_settings: dict[str, ProviderSetting]) -> LiveSyncMode | None:
+    setting = provider_settings.get(provider)
+    return setting.live_sync_mode if setting else LiveSyncMode.PULL
+
+
+def include_in_periodic_pull(
+    caps: ProviderCapabilities, live_sync_mode: LiveSyncMode | None, is_historical: bool
+) -> bool:
+    """True if the provider belongs in this REST pull run; live sync polls pull mode only."""
+    return caps.rest_pull and (is_historical or live_sync_mode == LiveSyncMode.PULL)
 
 
 class ProviderSettingsService:
@@ -20,6 +31,23 @@ class ProviderSettingsService:
     def __init__(self):
         self.factory = ProviderFactory()
         self.repo = ProviderSettingsRepository()
+
+    def get_pull_eligible_providers(self, db: DbSession) -> list[str]:
+        """Providers the periodic sync polls, so users of push-only ones are never enqueued."""
+        provider_settings = self.repo.get_all(db)
+        return [
+            name.value
+            for name in ProviderName
+            if name not in _NON_PROVIDER_NAMES
+            and include_in_periodic_pull(
+                self.factory.get_provider(name.value).capabilities,
+                live_sync_mode_of(name.value, provider_settings),
+                is_historical=False,
+            )
+        ]
+
+    def get_settings_map(self, db: DbSession) -> dict[str, ProviderSetting]:
+        return self.repo.get_all(db)
 
     def _to_read(self, provider_key: str, setting_map: dict) -> ProviderSettingRead:
         strategy = self.factory.get_provider(provider_key)
@@ -36,12 +64,13 @@ class ProviderSettingsService:
                 else strategy.default_live_sync_mode
             ),
             live_sync_configurable=strategy.live_sync_configurable,
+            data_granularity=setting.data_granularity if setting else None,
         )
 
     def get_all_providers(self, db: DbSession) -> list[ProviderSettingRead]:
         """Get all providers merged with their DB settings and strategy metadata."""
         db_settings_map = self.repo.get_all(db)
-        return [self._to_read(p.value, db_settings_map) for p in ProviderName if p.value not in ("unknown", "internal")]
+        return [self._to_read(p.value, db_settings_map) for p in ProviderName if p not in _NON_PROVIDER_NAMES]
 
     def update_provider_setting(
         self,
@@ -68,11 +97,12 @@ class ProviderSettingsService:
         if effective_live_sync_mode is None and (current is None or current.live_sync_mode is None):
             effective_live_sync_mode = strategy.default_live_sync_mode
 
-        setting = self.repo.upsert(db, provider, new_is_enabled, effective_live_sync_mode)
+        effective_granularity = update.data_granularity or (current.data_granularity if current else None)
 
-        if update.live_sync_mode == LiveSyncMode.WEBHOOK and strategy.capabilities.webhook_registration_api:
-            callback_url = f"{settings.api_base_url}{settings.api_v1}/providers/{provider}/webhooks"
-            celery_app.send_task(_REGISTER_WEBHOOKS_TASK, args=[provider, callback_url], queue="webhook_sync")
+        setting = self.repo.upsert(db, provider, new_is_enabled, effective_live_sync_mode, effective_granularity)
+
+        if update.live_sync_mode is not None:
+            strategy.apply_live_sync_mode(update.live_sync_mode)
 
         return ProviderSettingRead(
             provider=provider,
@@ -84,6 +114,7 @@ class ProviderSettingsService:
                 setting.live_sync_mode if setting.live_sync_mode is not None else strategy.default_live_sync_mode
             ),
             live_sync_configurable=strategy.live_sync_configurable,
+            data_granularity=setting.data_granularity,
         )
 
     def bulk_update_providers(self, db: DbSession, updates: dict[str, bool]) -> list[ProviderSettingRead]:
@@ -96,3 +127,6 @@ class ProviderSettingsService:
 
         self.repo.bulk_update(db, updates)
         return self.get_all_providers(db)
+
+
+provider_settings_service = ProviderSettingsService()

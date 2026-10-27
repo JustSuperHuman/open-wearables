@@ -3,10 +3,14 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from app.schemas.enums import SeriesType
+from app.constants.devices_map import normalize_device_model
+from app.schemas.enums import DeviceType, Resolution, SeriesType
 from app.utils.dates import ZoneOffset
+from app.utils.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
+
+from .source_filters import SourceFilterParams
 
 
 class TimeSeriesSampleBase(BaseModel):
@@ -25,6 +29,8 @@ class TimeSeriesSampleBase(BaseModel):
     # treats None as False. Set explicitly by the provider save path (Garmin dailies vs epochs).
     is_daily_total: bool | None = None
 
+    _normalize_device_model = field_validator("device_model")(normalize_device_model)
+
 
 class TimeSeriesSampleCreate(TimeSeriesSampleBase):
     id: UUID
@@ -32,6 +38,10 @@ class TimeSeriesSampleCreate(TimeSeriesSampleBase):
     provider: str | None = None
     user_connection_id: UUID | None = None
     software_version: str | None = None
+    device_type: DeviceType | None = None
+    device_id: str | None = None
+    source_app_id: str | None = None
+    device_manufacturer: str | None = None
 
 
 class TimeSeriesSampleUpdate(TimeSeriesSampleBase):
@@ -42,37 +52,29 @@ class TimeSeriesSampleResponse(TimeSeriesSampleBase):
     """Generic response payload for data point series."""
 
     id: UUID
-    data_source_id: UUID
+    data_source_id: UUID  # ty:ignore[invalid-mutable-override]
 
 
 class HeartRateSampleCreate(TimeSeriesSampleCreate):
     """Create payload for heart rate samples."""
 
-    series_type: Literal[SeriesType.heart_rate] = SeriesType.heart_rate
+    series_type: Literal[SeriesType.heart_rate] = SeriesType.heart_rate  # ty:ignore[invalid-mutable-override]
 
 
 class StepSampleCreate(TimeSeriesSampleCreate):
     """Create payload for step count samples."""
 
-    series_type: Literal[SeriesType.steps] = SeriesType.steps
+    series_type: Literal[SeriesType.steps] = SeriesType.steps  # ty:ignore[invalid-mutable-override]
 
 
-class TimeSeriesQueryParams(BaseModel):
+class TimeSeriesQueryParams(SourceFilterParams):
     """Filters for retrieving time series samples."""
 
     start_datetime: datetime | None = Field(None, description="Lower bound (inclusive) for recorded timestamp")
     end_datetime: datetime | None = Field(None, description="Upper bound (inclusive) for recorded timestamp")
-    device_model: str | None = Field(
-        None,
-        description="Device model filter",
-    )
-    source: str | None = Field(None, description="Optional data source filter")
-    data_source_id: UUID | None = Field(
-        None,
-        description="Direct data source identifier filter.",
-    )
-    limit: int = Field(50, ge=1, le=1000, description="Maximum number of samples to return")
+    limit: int = Field(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE, description="Maximum number of samples to return")
     cursor: str | None = Field(
         None,
         description="Pagination cursor (use next_cursor for forward, previous_cursor for backward)",
     )
+    resolution: Resolution = Resolution.RAW

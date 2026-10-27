@@ -12,12 +12,12 @@ stack to Fly apps:
 | `celery-beat`   | `open-wearables-api` process `beat`   | Same backend image                      |
 | `flower`        | `open-wearables-flower`               | Public Celery dashboard with basic auth |
 | `svix-server`   | `open-wearables-svix`                 | Internal webhook server on `.flycast`   |
-| `frontend`      | `open-wearables-frontend`             | Nitro server on `:3000`                 |
+| `frontend`      | `open-wearables-frontend`             | SvelteKit (Bun) server on `:3000`       |
 
 Config files in this repo:
 
 - `backend/fly.toml` - API, worker, and beat process groups
-- `frontend/fly.toml` - frontend Nitro server
+- `frontend/fly.toml` - frontend SvelteKit server
 - `deploy/fly/redis.toml` - internal Redis
 - `deploy/fly/flower.toml` - Flower
 - `deploy/fly/svix.toml` - Svix
@@ -230,7 +230,7 @@ bun run deploy frontend
 ```
 
 The helper passes `VITE_API_URL` from `FLY_API_URL` during deploy. The frontend
-also reads `VITE_API_URL` at runtime in the Nitro server, so you do not need to
+also reads `VITE_API_URL` at runtime in the SvelteKit server, so you do not need to
 rebuild the image to point it at a different API. For a custom API:
 
 ```bash

@@ -36,6 +36,8 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "elevation_profile",
         "energy_burned",
         "moving_time_seconds",
+        "entry_source",
+        "label",
     }
 )
 

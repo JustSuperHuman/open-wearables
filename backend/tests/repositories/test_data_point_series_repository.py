@@ -13,10 +13,11 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataSource
-from app.repositories.data_point_series_repository import DataPointSeriesRepository
+from app.repositories.data_point_series_repository import DataPointSeriesRepository, TypeCounts, WriteCounts
 from app.schemas.enums import SeriesType
 from app.schemas.model_crud.activities import TimeSeriesQueryParams, TimeSeriesSampleCreate
 from tests.factories import DataSourceFactory, UserFactory
@@ -548,53 +549,14 @@ class TestDataPointSeriesRepository:
         assert result[1] == 2  # Yesterday
         assert result[2] == 3  # Today
 
-    def test_get_count_by_series_type(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
-        """Test aggregating data point counts by series type."""
-        # Arrange
-        user = UserFactory()
-        mapping = DataSourceFactory(user=user)
-        now = datetime.now(timezone.utc)
-
-        # Create heart rate samples
-        for i in range(3):
-            sample = TimeSeriesSampleCreate(
-                id=uuid4(),
-                user_id=user.id,
-                source="apple",
-                device_model="device1",
-                data_source_id=mapping.id,
-                recorded_at=now + timedelta(seconds=i),
-                value=72,
-                series_type=SeriesType.heart_rate,
-            )
-            series_repo.create(db, sample)
-
-        # Create steps samples
-        for i in range(2):
-            sample = TimeSeriesSampleCreate(
-                id=uuid4(),
-                user_id=user.id,
-                source="apple",
-                device_model="device1",
-                data_source_id=mapping.id,
-                recorded_at=now + timedelta(seconds=i),
-                value=10000,
-                series_type=SeriesType.steps,
-            )
-            series_repo.create(db, sample)
-
+    def test_get_approximate_total_count(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
+        """The reltuples-based approximate count should return a non-negative integer."""
         # Act
-        results = series_repo.get_count_by_series_type(db)
+        result = series_repo.get_approximate_total_count(db)
 
         # Assert
-        counts_dict = dict(results)
-        from app.schemas.enums import get_series_type_id
-
-        hr_type_id = get_series_type_id(SeriesType.heart_rate)
-        steps_type_id = get_series_type_id(SeriesType.steps)
-
-        assert counts_dict.get(hr_type_id, 0) >= 3
-        assert counts_dict.get(steps_type_id, 0) >= 2
+        assert isinstance(result, int)
+        assert result >= 0
 
     def test_get_count_by_source(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         """Test aggregating data point counts by source."""
@@ -722,15 +684,17 @@ class TestDataPointSeriesRepository:
         assert (counts.inserted, counts.updated) == (0, 0)
         assert int(counts) == 0
 
-    def test_bulk_create_batch_exceeding_one_chunk(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
-        """A batch larger than one chunk must stay under Postgres' 65535-param cap.
+    def test_bulk_create_large_batch(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
+        """A large batch inserts every row correctly in one call.
 
-        Regression: a full chunk * columns-per-row once overflowed 65535 bind
-        params (e.g. 9000 rows * 8 cols), failing the whole insert.
+        _insert_data_points writes via COPY, which has no per-statement bind-param
+        limit (unlike the old INSERT ... VALUES (...) it replaced), so this isn't
+        chasing a specific size threshold - just a sanity check that dedup/counting
+        stay correct at a scale well beyond the handful of rows other tests use.
         """
         user = UserFactory()
         base = datetime(2099, 1, 1, tzinfo=timezone.utc)
-        n = series_repo.BATCH_INSERT_CHUNK_SIZE + 500
+        n = 10_000
         samples = [
             TimeSeriesSampleCreate(
                 id=uuid4(),
@@ -745,6 +709,102 @@ class TestDataPointSeriesRepository:
 
         counts = series_repo.bulk_create(db, samples)
         assert counts.inserted == n
+
+    def test_bulk_create_skips_rewriting_unchanged_duplicates(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """Re-writing an identical row must not physically touch it (verified via xmin)."""
+        # Arrange
+        user = UserFactory()
+        ts = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        sample = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user.id,
+            source="oura",
+            recorded_at=ts,
+            value=42,
+            series_type=SeriesType.steps,
+            data_source_id=None,
+        )
+
+        # Act
+        series_repo.bulk_create(db, [sample])
+        db.commit()
+        row_id = db.query(DataPointSeries.id).filter(DataPointSeries.recorded_at == ts).one()[0]
+        xmin_before = db.execute(text("SELECT xmin FROM data_point_series WHERE id = :id"), {"id": row_id}).scalar()
+
+        # Re-send the exact same row: same value, same everything -> conflicts, but
+        # nothing actually differs.
+        counts = series_repo.bulk_create(db, [sample])
+        db.commit()
+        xmin_after = db.execute(text("SELECT xmin FROM data_point_series WHERE id = :id"), {"id": row_id}).scalar()
+
+        # Assert
+        assert counts.updated == 1  # still reported as a conflict, per WriteCounts' contract
+        assert xmin_after == xmin_before  # but Postgres never actually rewrote the row
+
+    def test_bulk_create_still_updates_when_value_actually_changes(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """The no-op skip must not swallow genuine changes - only true duplicates."""
+        # Arrange
+        user = UserFactory()
+        ts = datetime(2099, 1, 2, tzinfo=timezone.utc)
+
+        def sample(value: int) -> TimeSeriesSampleCreate:
+            return TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user.id,
+                source="oura",
+                recorded_at=ts,
+                value=value,
+                series_type=SeriesType.steps,
+                data_source_id=None,
+            )
+
+        # Act
+        series_repo.bulk_create(db, [sample(1000)])
+        db.commit()
+
+        series_repo.bulk_create(db, [sample(2000)])
+        db.commit()
+
+        # Assert
+        stored = db.query(DataPointSeries.value).filter(DataPointSeries.recorded_at == ts).scalar()
+        assert stored == 2000
+
+    def test_bulk_create_null_fields_round_trip_through_copy(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """external_id/zone_offset/is_daily_total=None must survive COPY, not become
+        placeholder strings or fail to load - COPY has different NULL-encoding rules
+        than a parameterized query, so this is worth checking explicitly.
+        """
+        # Arrange
+        user = UserFactory()
+        sample = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user.id,
+            source="oura",
+            recorded_at=datetime(2099, 1, 3, tzinfo=timezone.utc),
+            value=Decimal("1.5"),
+            series_type=SeriesType.steps,
+            external_id=None,
+            zone_offset=None,
+            is_daily_total=None,
+            data_source_id=None,
+        )
+
+        # Act
+        series_repo.bulk_create(db, [sample])
+        db.commit()
+
+        # Assert
+        stored = db.query(DataPointSeries).filter(DataPointSeries.id == sample.id).one()
+        assert stored.external_id is None
+        assert stored.zone_offset is None
+        assert stored.is_daily_total is None
+        assert stored.value == Decimal("1.5")
 
     # ------------------------------------------------------------------
     # get_daily_activity_aggregates — prefer-daily-total-else-sum logic
@@ -842,3 +902,123 @@ class TestDataPointSeriesRepository:
         by_source = {r["source"]: r["steps_sum"] for r in result}
         assert by_source["garmin"] == 10000
         assert by_source["apple"] == 8000
+
+
+class TestPerTypeWriteCounts:
+    """bulk_create reports per canonical series type, not per provider fetch task."""
+
+    @pytest.fixture
+    def series_repo(self) -> DataPointSeriesRepository:
+        return DataPointSeriesRepository(DataPointSeries)
+
+    @staticmethod
+    def _sample(user_id: UUID, recorded_at: datetime, series_type: SeriesType) -> TimeSeriesSampleCreate:
+        return TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user_id,
+            source="oura",
+            provider="oura",
+            recorded_at=recorded_at,
+            value=60,
+            series_type=series_type,
+        )
+
+    def test_breakdown_is_keyed_by_series_type_with_its_own_span(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        user = UserFactory()
+        now = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+
+        counts = series_repo.bulk_create(
+            db,
+            [
+                self._sample(user.id, now, SeriesType.heart_rate),
+                self._sample(user.id, now + timedelta(hours=3), SeriesType.heart_rate),
+                self._sample(user.id, now + timedelta(hours=1), SeriesType.steps),
+            ],
+        )
+        db.commit()
+
+        assert set(counts.by_type) == {"heart_rate", "steps"}
+        assert counts.by_type["heart_rate"].inserted == 2
+        assert counts.by_type["heart_rate"].covered_start == now
+        assert counts.by_type["heart_rate"].covered_end == now + timedelta(hours=3)
+        assert counts.by_type["steps"].inserted == 1
+        assert counts.inserted == 3
+
+    def test_rewriting_a_sample_counts_as_updated_for_its_type(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        user = UserFactory()
+        now = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        first = self._sample(user.id, now, SeriesType.heart_rate)
+        series_repo.bulk_create(db, [first])
+        db.commit()
+
+        counts = series_repo.bulk_create(db, [first.model_copy(update={"value": 99})])
+        db.commit()
+
+        assert counts.by_type["heart_rate"].inserted == 0
+        assert counts.by_type["heart_rate"].updated == 1
+
+    def test_unchanged_resync_still_counts_as_updated(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """An identical row never reaches RETURNING, so it must be counted from staging."""
+        user = UserFactory()
+        now = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        sample = self._sample(user.id, now, SeriesType.heart_rate)
+        series_repo.bulk_create(db, [sample])
+        db.commit()
+
+        counts = series_repo.bulk_create(db, [sample])
+        db.commit()
+
+        assert counts.by_type["heart_rate"].inserted == 0
+        assert counts.by_type["heart_rate"].updated == 1
+        assert sum(c.updated for c in counts.by_type.values()) == counts.updated
+
+    def test_breakdowns_merge_when_counts_are_summed(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
+        """Providers accumulate counts across batches; the per-type spans must widen."""
+        user = UserFactory()
+        now = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+
+        first = series_repo.bulk_create(db, [self._sample(user.id, now, SeriesType.heart_rate)])
+        db.commit()
+        second = series_repo.bulk_create(
+            db,
+            [
+                self._sample(user.id, now + timedelta(days=1), SeriesType.heart_rate),
+                self._sample(user.id, now, SeriesType.steps),
+            ],
+        )
+        db.commit()
+
+        total = first + second
+
+        assert set(total.by_type) == {"heart_rate", "steps"}
+        assert total.by_type["heart_rate"].inserted == 2
+        assert total.by_type["heart_rate"].covered_start == now
+        assert total.by_type["heart_rate"].covered_end == now + timedelta(days=1)
+
+    def test_adding_counts_keeps_the_split_types_and_span_but_a_plain_int_only_the_total(self) -> None:
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        counts = WriteCounts(
+            2,
+            1,
+            {
+                "steps": TypeCounts(2, 1, start, start + timedelta(days=1)),
+                "heart_rate": TypeCounts(0, 0, start - timedelta(days=1), start),
+            },
+        )
+
+        merged = counts + WriteCounts(
+            1, 0, {"steps": TypeCounts(1, 0, start + timedelta(days=2), start + timedelta(days=2))}
+        )
+        with_int = counts + 5
+
+        assert (merged.inserted, merged.updated) == (3, 1)
+        assert merged.by_type["steps"].inserted == 3
+        assert (merged.covered_start, merged.covered_end) == (start - timedelta(days=1), start + timedelta(days=2))
+        # A plain int has no split to keep, so the sum is a plain int.
+        assert (type(with_int), with_int) == (int, 8)

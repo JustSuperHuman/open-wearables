@@ -37,6 +37,7 @@ from fastapi import HTTPException, Request
 from pydantic import ValidationError
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryQueue, CeleryTask
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.schemas.providers.whoop import WhoopWebhookNotification, WhoopWebhookNotificationType
@@ -47,8 +48,6 @@ from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
-
-_PROCESS_PUSH_TASK = "app.integrations.celery.tasks.webhook_push_task.process_webhook_push"
 
 
 class WhoopWebhookHandler(BaseWebhookHandler):
@@ -147,7 +146,9 @@ class WhoopWebhookHandler(BaseWebhookHandler):
 
         store_raw_payload(source="webhook", provider="whoop", payload=payload, trace_id=request_trace_id)
 
-        task = celery_app.send_task(_PROCESS_PUSH_TASK, args=["whoop", payload, request_trace_id], queue="webhook_sync")
+        task = celery_app.send_task(
+            CeleryTask.PROCESS_WEBHOOK_PUSH, args=["whoop", payload, request_trace_id], queue=CeleryQueue.WEBHOOK_SYNC
+        )
         log_structured(
             logger,
             "info",
@@ -241,9 +242,30 @@ class WhoopWebhookHandler(BaseWebhookHandler):
             case WhoopWebhookNotificationType.WORKOUT_UPDATED:
                 count = self.workouts.load_single_workout(db, user_id, resource_id)
             case WhoopWebhookNotificationType.SLEEP_UPDATED:
-                count = self.data_247.load_single_sleep(db, user_id, resource_id)
+                # Falling asleep closes a cycle, and Whoop emits no cycle event, so this
+                # is also the trigger for refreshing the cycle that just ended.
+                count, closed_at = self.data_247.load_single_sleep(db, user_id, resource_id)
+                if closed_at:
+                    self.data_247.load_closed_cycle(db, user_id, closed_at)
             case WhoopWebhookNotificationType.RECOVERY_UPDATED:
-                count = self.data_247.load_single_recovery(db, user_id, resource_id)
+                sleep = self.data_247.get_sleep_record(db, user_id, resource_id)
+                cycle_id = sleep.get("cycle_id") if isinstance(sleep, dict) else None
+                if not cycle_id:
+                    log_structured(
+                        logger,
+                        "warning",
+                        "No cycle_id found in sleep record for Whoop recovery.updated",
+                        provider="whoop",
+                        action="whoop_webhook_recovery_missing_cycle_id",
+                        user_id=str(user_id),
+                        resource_id=resource_id,
+                    )
+                    return {
+                        "status": "ignored",
+                        "reason": "missing_cycle_id",
+                        "resource_id": resource_id,
+                    }
+                count = self.data_247.load_single_recovery(db, user_id, str(cycle_id))
             case _:
                 return {"status": "ignored", "reason": f"unhandled_event_type: {event_type}"}
 

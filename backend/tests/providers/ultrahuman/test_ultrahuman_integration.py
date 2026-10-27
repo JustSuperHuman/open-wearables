@@ -49,8 +49,8 @@ class TestUltrahumanSleepDataIntegration:
 
             assert mock_request.call_count == 2  # 2 days in range
             assert results is not None
-            assert "sleep_sessions_synced" in results
-            assert results["sleep_sessions_synced"] >= 0
+            assert "sleep" in results.outcomes
+            assert results.outcomes["sleep"].rows_written >= 0
 
     def test_verify_sleep_records_in_database_with_mocked_api(
         self, db: Session, sample_ultrahuman_api_response: dict
@@ -72,7 +72,7 @@ class TestUltrahumanSleepDataIntegration:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["sleep_sessions_synced"] > 0, "Fixture has sleep data, expected synced sessions"
+            assert results.outcomes["sleep"].rows_written > 0, "Fixture has sleep data, expected synced sessions"
             records = (
                 db.query(EventRecord)
                 .join(DataSource)
@@ -135,7 +135,7 @@ class TestUltrahumanSleepDataIntegration:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["sleep_sessions_synced"] > 0, "Fixture has sleep data, expected synced sessions"
+            assert results.outcomes["sleep"].rows_written > 0, "Fixture has sleep data, expected synced sessions"
             records = (
                 db.query(EventRecord)
                 .join(DataSource)
@@ -174,7 +174,7 @@ class TestUltrahumanSleepDataIntegration:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["sleep_sessions_synced"] > 0, "Fixture has sleep data, expected synced sessions"
+            assert results.outcomes["sleep"].rows_written > 0, "Fixture has sleep data, expected synced sessions"
             records = (
                 db.query(EventRecord)
                 .join(DataSource)
@@ -201,6 +201,48 @@ class TestUltrahumanSleepDataIntegration:
 
             assert not all_zero, "All sleep stage values are zero - parsing may be broken"
 
+    def test_sleep_graph_stages_persisted_to_jsonb_with_mocked_api(
+        self, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        """Verify sleep_graph.data intervals are normalized and stored in sleep_details.sleep_stages."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+
+        factory = ProviderFactory()
+        strategy = factory.get_provider("ultrahuman")
+        provider_impl = strategy.data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        end_time = datetime(2024, 1, 16, tzinfo=timezone.utc)
+        start_time = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+        with patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response):
+            provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
+            db.commit()
+
+        details = (
+            db.query(SleepDetails)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource)
+            .filter(DataSource.user_id == user.id, EventRecord.category == "sleep")
+            .all()
+        )
+
+        with_stages = [d for d in details if d.sleep_stages]
+        assert with_stages, "Expected at least one sleep record with sleep_stages populated"
+
+        for detail in with_stages:
+            stages = detail.sleep_stages
+            # Stored as a JSONB list of {stage, start_time, end_time} with ISO 8601 strings.
+            assert isinstance(stages, list)
+            assert len(stages) > 0
+            for interval in stages:
+                assert set(interval) >= {"stage", "start_time", "end_time"}
+                assert isinstance(interval["start_time"], str)  # unix ts → ISO 8601 string
+                assert "T" in interval["start_time"]
+            assert {i["stage"] for i in stages} <= {"awake", "light", "deep", "rem", "unknown"}
+
 
 class TestUltrahumanActivitySamplesIntegration:
     """Integration tests for Ultrahuman activity samples synchronization."""
@@ -226,8 +268,8 @@ class TestUltrahumanActivitySamplesIntegration:
             db.commit()
 
             assert results is not None
-            assert "activity_samples" in results
-            assert results["activity_samples"] >= 0
+            assert "activity_samples" in results.outcomes
+            assert results.outcomes["activity_samples"].rows_written >= 0
 
     def test_verify_activity_samples_in_database_with_mocked_api(
         self, db: Session, sample_ultrahuman_api_response: dict
@@ -249,7 +291,9 @@ class TestUltrahumanActivitySamplesIntegration:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["activity_samples"] > 0, "Fixture has activity data, expected synced samples"
+            assert results.outcomes["activity_samples"].rows_written > 0, (
+                "Fixture has activity data, expected synced samples"
+            )
 
             samples = (
                 db.query(DataPointSeries)
@@ -271,7 +315,7 @@ class TestUltrahumanActivitySamplesIntegration:
                     type_id_to_code[sample.series_type_definition_id] = std.code if std else None
 
             synced_codes = set(type_id_to_code.values())
-            expected_codes = {"heart_rate", "heart_rate_variability_sdnn", "body_temperature", "steps"}
+            expected_codes = {"heart_rate", "heart_rate_variability_rmssd", "skin_temperature", "steps"}
 
             for code in expected_codes:
                 assert code in synced_codes, f"{code} missing from synced samples"
@@ -309,6 +353,103 @@ class TestUltrahumanActivitySamplesIntegration:
         for sample in samples:
             value = float(sample.value)
             assert 15 <= value <= 90, f"VO2 max {value} is outside realistic range (15-90 ml/kg/min)"
+
+    def test_temperature_deviation_saved_as_skin_temperature_deviation(
+        self, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        """The ring's nightly deviation from baseline reaches the skin_temperature_deviation series."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        with patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response):
+            provider_impl.load_and_save_all(
+                db,
+                user.id,
+                start_time=datetime(2024, 1, 15, tzinfo=timezone.utc),
+                end_time=datetime(2024, 1, 16, tzinfo=timezone.utc),
+            )
+            db.commit()
+
+        samples = (
+            db.query(DataPointSeries)
+            .join(DataSource)
+            .join(SeriesTypeDefinition, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
+            .filter(
+                DataSource.user_id == user.id,
+                SeriesTypeDefinition.code == SeriesType.skin_temperature_deviation.value,
+            )
+            .all()
+        )
+
+        assert [float(sample.value) for sample in samples] == [-0.2]
+
+    def test_sleep_rhr_saved_as_resting_heart_rate(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
+        """The ring's overnight resting heart rate reaches the resting_heart_rate series."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        with patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response):
+            provider_impl.load_and_save_all(
+                db,
+                user.id,
+                start_time=datetime(2024, 1, 15, tzinfo=timezone.utc),
+                end_time=datetime(2024, 1, 16, tzinfo=timezone.utc),
+            )
+            db.commit()
+
+        samples = (
+            db.query(DataPointSeries)
+            .join(DataSource)
+            .join(SeriesTypeDefinition, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
+            .filter(
+                DataSource.user_id == user.id,
+                SeriesTypeDefinition.code == SeriesType.resting_heart_rate.value,
+            )
+            .all()
+        )
+
+        assert [float(sample.value) for sample in samples] == [51]
+        assert samples[0].recorded_at == datetime(2024, 1, 15, 0, 0, tzinfo=timezone.utc)
+
+    def test_active_minutes_saved_as_exercise_time(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
+        """Ultrahuman's active minutes are moderate to vigorous activity, not all non-sedentary time."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        with patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response):
+            provider_impl.load_and_save_all(
+                db,
+                user.id,
+                start_time=datetime(2024, 1, 15, tzinfo=timezone.utc),
+                end_time=datetime(2024, 1, 16, tzinfo=timezone.utc),
+            )
+            db.commit()
+
+        codes_and_values = (
+            db.query(SeriesTypeDefinition.code, DataPointSeries.value)
+            .select_from(DataPointSeries)
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .join(SeriesTypeDefinition, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
+            .filter(
+                DataSource.user_id == user.id,
+                SeriesTypeDefinition.code.in_([SeriesType.exercise_time.value, SeriesType.active_time.value]),
+            )
+            .all()
+        )
+
+        assert [(code, float(value)) for code, value in codes_and_values] == [(SeriesType.exercise_time.value, 35)]
 
     def test_heart_rate_values_are_reasonable_with_mocked_api(
         self, db: Session, sample_ultrahuman_api_response: dict
@@ -349,7 +490,7 @@ class TestUltrahumanActivitySamplesIntegration:
     def test_temperature_values_are_reasonable_with_mocked_api(
         self, db: Session, sample_ultrahuman_api_response: dict
     ) -> None:
-        """Verify temperature values are within realistic range (35-42°C)."""
+        """Verify skin temperature values are within realistic range."""
         user = UserFactory()
         UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
         DataSourceFactory(user_id=user.id, provider="ultrahuman")
@@ -372,7 +513,7 @@ class TestUltrahumanActivitySamplesIntegration:
             .join(SeriesTypeDefinition, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
             .filter(
                 DataSource.user_id == user.id,
-                SeriesTypeDefinition.code == SeriesType.body_temperature.value,
+                SeriesTypeDefinition.code == SeriesType.skin_temperature.value,
             )
             .all()
         )
@@ -431,7 +572,7 @@ class TestUltrahumanAPIEndpoints:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["sleep_sessions_synced"] > 0, "Fixture has sleep data, expected synced sessions"
+            assert results.outcomes["sleep"].rows_written > 0, "Fixture has sleep data, expected synced sessions"
             records = (
                 db.query(EventRecord)
                 .join(DataSource)
@@ -464,7 +605,9 @@ class TestUltrahumanAPIEndpoints:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["activity_samples"] > 0, "Fixture has activity data, expected synced samples"
+            assert results.outcomes["activity_samples"].rows_written > 0, (
+                "Fixture has activity data, expected synced samples"
+            )
             samples = db.query(DataPointSeries).join(DataSource).filter(DataSource.user_id == user.id).all()
 
             assert len(samples) > 0, "Should have activity samples after sync"
@@ -494,10 +637,10 @@ class TestUltrahumanErrorHandling:
             db.commit()
 
             assert results is not None
-            assert "sleep_sessions_synced" in results
-            assert "activity_samples" in results
-            assert isinstance(results["sleep_sessions_synced"], int)
-            assert isinstance(results["activity_samples"], int)
+            assert "sleep" in results.outcomes
+            assert "activity_samples" in results.outcomes
+            assert isinstance(results.outcomes["sleep"].rows_written, int)
+            assert isinstance(results.outcomes["activity_samples"].rows_written, int)
 
     def test_sync_handles_partial_data_with_mocked_api(self, db: Session) -> None:
         """Verify sync handles days with partial data (sleep but no activity)."""
@@ -543,10 +686,10 @@ class TestUltrahumanErrorHandling:
             db.commit()
 
             assert results is not None
-            assert "sleep_sessions_synced" in results
-            assert "activity_samples" in results
-            assert isinstance(results["sleep_sessions_synced"], int)
-            assert isinstance(results["activity_samples"], int)
+            assert "sleep" in results.outcomes
+            assert "activity_samples" in results.outcomes
+            assert isinstance(results.outcomes["sleep"].rows_written, int)
+            assert isinstance(results.outcomes["activity_samples"].rows_written, int)
 
     def test_sync_respects_date_range_with_mocked_api(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
         """Verify sync only fetches data within specified date range."""
@@ -566,7 +709,7 @@ class TestUltrahumanErrorHandling:
             results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
             db.commit()
 
-            assert results["sleep_sessions_synced"] > 0, "Fixture has sleep data, expected synced sessions"
+            assert results.outcomes["sleep"].rows_written > 0, "Fixture has sleep data, expected synced sessions"
             records = (
                 db.query(EventRecord)
                 .join(DataSource)
@@ -584,3 +727,119 @@ class TestUltrahumanErrorHandling:
                 assert record.start_datetime <= end_time, (
                     f"Sleep record {record.start_datetime} is after end time {end_time}"
                 )
+
+
+class TestUltrahumanSyncCountContract:
+    """Guards the fix for the "Success but 0 items" sync report.
+
+    The sync orchestrator takes its headline count from ``Sync247Result.rows_written``
+    and its new-vs-updated split from ``.inserted`` / ``.updated``, so every
+    write path has to report the rows it actually persisted.
+    """
+
+    def test_saved_counts_are_countable_by_the_orchestrator(
+        self, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+
+        factory = ProviderFactory()
+        strategy = factory.get_provider("ultrahuman")
+        provider_impl = strategy.data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        # Single-day range: the mock returns the same payload for every day in
+        # the range, so a multi-day range would upsert-update the same rows and
+        # produce updates. One day keeps the first sync deterministically all
+        # inserts.
+        start_time = datetime(2024, 1, 15, tzinfo=timezone.utc)
+        end_time = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+        with patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response):
+            results = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
+            db.commit()
+
+        # Fixture carries both sleep and activity data.
+        assert results.outcomes["sleep"].rows_written > 0
+        assert results.outcomes["activity_samples"].rows_written > 0
+
+        # Activity samples go through the bulk upsert, so they carry the split;
+        # sleep sessions are merged one at a time and report a total only.
+        assert results.outcomes["activity_samples"].counts is not None
+        assert results.outcomes["activity_samples"].counts.updated == 0
+        assert results.outcomes["sleep"].counts is None
+
+        # The orchestrator's headline count covers both, split or not.
+        assert (
+            results.rows_written
+            == results.outcomes["sleep"].rows_written + results.outcomes["activity_samples"].rows_written
+        )
+        assert results.inserted == results.outcomes["activity_samples"].rows_written
+        assert results.updated == 0
+        assert not results.failures
+
+    def test_a_null_metric_object_does_not_drop_its_siblings(
+        self, db: Session, sample_ultrahuman_api_response: dict
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        response = {
+            "data": {
+                "metric_data": [
+                    *sample_ultrahuman_api_response["data"]["metric_data"],
+                    {"type": "temp", "object": None},
+                ]
+            }
+        }
+        day = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+        with patch.object(provider_impl, "_make_api_request", return_value=response):
+            results = provider_impl.load_and_save_all(db, user.id, start_time=day, end_time=day)
+
+        assert not results.failures
+        assert results.outcomes["activity_samples"].rows_written > 0
+
+    def test_resync_upserts_instead_of_duplicating(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
+        """Re-syncing the same day must upsert (dedupe), not insert duplicate rows."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
+        DataSourceFactory(user_id=user.id, provider="ultrahuman")
+
+        factory = ProviderFactory()
+        strategy = factory.get_provider("ultrahuman")
+        provider_impl = strategy.data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        # Single-day range so the first sync is deterministically all inserts;
+        # the re-sync then exercises the upsert/update path on the same rows.
+        start_time = datetime(2024, 1, 15, tzinfo=timezone.utc)
+        end_time = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+        def _sample_rows() -> int:
+            return (
+                db.query(DataPointSeries)
+                .join(DataSource)
+                .filter(DataSource.user_id == user.id, DataSource.provider == "ultrahuman")
+                .count()
+            )
+
+        with patch.object(provider_impl, "_make_api_request", return_value=sample_ultrahuman_api_response):
+            first = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
+            db.commit()
+            rows_after_first = _sample_rows()
+
+            second = provider_impl.load_and_save_all(db, user.id, start_time=start_time, end_time=end_time)
+            db.commit()
+            rows_after_second = _sample_rows()
+
+        # First sync inserts; second sync updates the same rows in place.
+        assert first.inserted > 0
+        assert first.updated == 0
+        assert second.inserted == 0
+        assert second.updated == first.inserted
+        assert rows_after_second == rows_after_first, "Re-sync must not duplicate timeseries rows"

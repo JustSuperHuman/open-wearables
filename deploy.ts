@@ -321,7 +321,7 @@ const COMPONENTS: Component[] = [
   {
     key: "frontend",
     app: FRONTEND_APP,
-    summary: `Nitro web app -> ${API_URL}`,
+    summary: `SvelteKit web app -> ${API_URL}`,
     order: 3,
     async deploy() {
       await ensureApp(this.app);
@@ -348,7 +348,7 @@ const COMPONENTS: Component[] = [
           );
         }
       }
-      await $`fly deploy --config deploy/fly/svix.toml --app ${this.app} --primary-region ${REGION} --image svix/svix-server:v1 --ha=false`;
+      await $`fly deploy --config deploy/fly/svix.toml --app ${this.app} --primary-region ${REGION} --image svix/svix-server:v1.101.0 --ha=false`;
     },
   },
 ];

@@ -1,6 +1,6 @@
 ---
 title: "Deploy to Fly.io"
-description: "Deploy Open Wearables to Fly.io with FastAPI, Celery, Redis, Svix, Flower, and the React frontend."
+description: "Deploy Open Wearables to Fly.io with FastAPI, Celery, Redis, Svix, Flower, and the SvelteKit frontend."
 ---
 
 ## Overview
@@ -113,7 +113,7 @@ export FLY_FRONTEND_URL=https://app.example.com
     bun run deploy frontend
     ```
 
-    The frontend reads `VITE_API_URL` at runtime from the Nitro server
+    The frontend reads `VITE_API_URL` at runtime from the SvelteKit server
     environment. Set `FLY_API_URL` before deploying to point it at a custom API
     domain.
 
@@ -153,7 +153,7 @@ bun run deploy redis svix api flower frontend
 ## Related guides
 
 <CardGroup cols={2}>
-  <Card title="Docker Images" icon="docker" href="/deployment/docker-images">
+  <Card title="Docker" icon="docker" href="/deployment/docker">
     Run Open Wearables from prebuilt backend and frontend images.
   </Card>
   <Card title="Railway" icon="train" href="/deployment/railway">
