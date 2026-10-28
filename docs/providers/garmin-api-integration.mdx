@@ -195,7 +195,7 @@ GARMIN_BACKFILL_ENABLED=false
 # Source name Garmin Connect shows on workouts you push (max 20 characters, default: JustGains)
 GARMIN_WORKOUT_PROVIDER=YourApp
 
-# Shared secret on the push URLs (?token=...). See "Securing the push URL".
+# Shared secret in the push URLs (.../webhooks/t/<token>). See "Securing the push URL".
 GARMIN_WEBHOOK_TOKEN=generate-with-openssl-rand-hex-32
 GARMIN_WEBHOOK_TOKEN_REQUIRED=false
 
@@ -242,14 +242,20 @@ The flag defaults to `true`, which keeps the Enterprise behaviour described abov
 
 ## Securing the push URL
 
-Garmin doesn't sign its pushes. It identifies itself with a `garmin-client-id` header, and Open Wearables rejects any push whose header doesn't match `GARMIN_CLIENT_ID`. Your client id isn't a secret, though: it's in every OAuth link your users open. To make sure a push really comes from Garmin, put a shared token in the URLs you register in Garmin's portal. Garmin posts to each URL as registered, query string included, so the token arrives with every push.
+Garmin doesn't sign its pushes. It identifies itself with a `garmin-client-id` header, and Open Wearables rejects any push whose header doesn't match `GARMIN_CLIENT_ID`. Your client id isn't a secret, though: it's in every OAuth link your users open. To make sure a push really comes from Garmin, put a shared token in the URLs you register in Garmin's portal.
+
+Garmin's API Tools page drops the query string when it saves an endpoint URL, so the token goes in the path, as the last segment after `/t/`:
+
+```
+https://<your-domain>/api/v1/providers/garmin/webhooks/t/<GARMIN_WEBHOOK_TOKEN>
+```
 
 | Setting | Default | Effect |
 |---|---|---|
-| `GARMIN_WEBHOOK_TOKEN` | unset | The token expected in `?token=`, compared in constant time. Store it as a secret. |
+| `GARMIN_WEBHOOK_TOKEN` | unset | The token expected in the URL, compared in constant time. Store it as a secret. |
 | `GARMIN_WEBHOOK_TOKEN_REQUIRED` | `false` | `true`: a push without the right token gets `401`, on top of the client id check. `false`: the push is accepted and a warning is logged (without the token). |
 
-Open Wearables refuses to start with `GARMIN_WEBHOOK_TOKEN_REQUIRED=true` and no token, since that would reject every push. The check covers every Garmin push route: `/api/v1/providers/garmin/webhooks` and the older `/api/v1/garmin/webhooks/push` and `/ping`. Access logs mask `token` values.
+The token is read from the path (`/webhooks/t/<token>`) or, for callers that keep query strings, from `?token=`; either one matching counts. The deprecated routes take it the same way: `/api/v1/garmin/webhooks/push/t/<token>` and `/api/v1/garmin/webhooks/ping/t/<token>`. Open Wearables refuses to start with `GARMIN_WEBHOOK_TOKEN_REQUIRED=true` and no token, since that would reject every push. The access log, webhook logs and Sentry events show the path token as `REDACTED` (`[Filtered]` in Sentry) and mask `?token=` values.
 
 Roll it out in this order so no push is rejected while Garmin still uses the old URLs:
 
@@ -264,9 +270,9 @@ Roll it out in this order so no push is rejected while Garmin still uses the old
   <Step title="Update every endpoint URL in Garmin's portal">
     In [API Endpoints](https://apis.garmin.com/tools/endpoints), change each enabled endpoint to:
     ```
-    https://<your-domain>/api/v1/providers/garmin/webhooks?token=<GARMIN_WEBHOOK_TOKEN>
+    https://<your-domain>/api/v1/providers/garmin/webhooks/t/<GARMIN_WEBHOOK_TOKEN>
     ```
-    Use a token of hex characters (as `openssl rand -hex 32` gives you) so it needs no URL encoding.
+    Use a token of hex characters (as `openssl rand -hex 32` gives you) so it needs no URL encoding. After saving, reopen the page and check that the stored URL still ends in `/t/<token>`.
   </Step>
   <Step title="Confirm Garmin sends the token">
     Wait for a few pushes, then check the API logs: `Accepted Garmin push without a valid URL token` (action `webhook_token_not_enforced`) should no longer appear.

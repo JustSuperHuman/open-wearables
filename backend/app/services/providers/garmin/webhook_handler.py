@@ -46,6 +46,7 @@ from app.services.providers.garmin.workouts import GarminWorkouts
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import log_structured
+from app.utils.url_secrets import redact_path_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +91,14 @@ class GarminWebhookHandler(BaseWebhookHandler):
     failing closed when the value is not configured.
 
     The client id is not a secret (it is in every OAuth URL), so a shared token can be put on the
-    push URLs registered in Garmin's portal (``?token=``). With ``GARMIN_WEBHOOK_TOKEN`` set, a
-    matching token is checked in constant time; ``GARMIN_WEBHOOK_TOKEN_REQUIRED`` decides whether a
-    missing or wrong one is rejected (401) or only logged, so the portal URLs can be changed before
-    the token is enforced.
+    push URLs registered in Garmin's portal. Garmin's portal drops query strings on save, so the
+    token goes in the path (``/providers/garmin/webhooks/t/{token}``); ``?token=`` is accepted too.
+    With ``GARMIN_WEBHOOK_TOKEN`` set, a matching token in either place is checked in constant time;
+    ``GARMIN_WEBHOOK_TOKEN_REQUIRED`` decides whether a missing or wrong one is rejected (401) or
+    only logged, so the portal URLs can be changed before the token is enforced.
     """
+
+    accepts_path_token = True
 
     def __init__(self, garmin_workouts: GarminWorkouts, garmin_247: Garmin247Data, oauth: GarminOAuth) -> None:
         super().__init__("garmin")
@@ -155,16 +159,27 @@ class GarminWebhookHandler(BaseWebhookHandler):
 
     @staticmethod
     def _verify_url_token(request: Request) -> bool:
-        """Check the shared ``?token=`` from the registered push URL; only fails while it is required."""
+        """Check the shared token from the registered push URL; only fails while it is required.
+
+        The token is read from the path (``.../webhooks/t/{token}``) or the query (``?token=``);
+        either one matching is enough.
+        """
         expected = settings.garmin_webhook_token.get_secret_value() if settings.garmin_webhook_token else ""
         required = settings.garmin_webhook_token_required
         if not expected:
             # Settings refuse REQUIRED without a token; fail closed should that ever be bypassed.
             return not required
 
-        provided = request.query_params.get("token")
-        # compare_digest raises TypeError on non-ASCII str; the token is caller-supplied.
-        if provided and hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        provided = [
+            candidate
+            for candidate in (request.path_params.get("token"), request.query_params.get("token"))
+            if isinstance(candidate, str) and candidate
+        ]
+        expected_bytes = expected.encode("utf-8")
+        # compare_digest raises TypeError on non-ASCII str; the token is caller-supplied. Every
+        # candidate is compared, so the time taken doesn't depend on which one matched.
+        matches = [hmac.compare_digest(candidate.encode("utf-8"), expected_bytes) for candidate in provided]
+        if any(matches):
             return True
 
         if required:
@@ -179,7 +194,7 @@ class GarminWebhookHandler(BaseWebhookHandler):
             provider="garmin",
             action=action,
             token_present=bool(provided),
-            path=request.url.path,
+            path=redact_path_secrets(request.url.path),
         )
         return not required
 

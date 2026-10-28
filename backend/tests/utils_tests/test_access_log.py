@@ -1,5 +1,6 @@
 """Tests for access-log level derivation and the access-log middleware."""
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.config import Settings, settings
+from app.main import api
 from app.middlewares import add_access_log_middleware
 from app.utils.config_utils import AccessLogLevel, EnvironmentType
 
@@ -106,6 +108,28 @@ class TestAccessLogMiddleware:
         assert "s3cret" not in path
         assert f"{key}=REDACTED" in path
         assert "appli=1" in path
+
+    def test_webhook_path_token_is_redacted(self) -> None:
+        # Garmin's portal drops query strings, so its push token sits in the path instead.
+        app = FastAPI()
+
+        @app.post("/api/v1/providers/{provider}/webhooks/t/{token}")
+        async def push(provider: str, token: str) -> None:
+            return None
+
+        with patch.object(settings, "access_log_level", AccessLogLevel.ALL):
+            add_access_log_middleware(app)
+        with patch("app.middlewares.log_structured") as mock:
+            TestClient(app).post("/api/v1/providers/garmin/webhooks/t/s3cret?token=s3cret2")
+
+        path = mock.call_args_list[0].kwargs["path"]
+        assert path == "/api/v1/providers/garmin/webhooks/t/REDACTED?token=REDACTED"
+
+    def test_uvicorn_access_log_is_silenced_when_the_app_starts(self) -> None:
+        # uvicorn's own access log would print raw paths and query strings; this middleware
+        # is the only access log and it masks secrets in both.
+        with TestClient(api):
+            assert logging.getLogger("uvicorn.access").disabled is True
 
     def test_sdk_attribution_headers_are_logged(self) -> None:
         client = _build_client(AccessLogLevel.ALL)

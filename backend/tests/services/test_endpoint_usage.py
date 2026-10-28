@@ -135,6 +135,17 @@ class TestEndpointUsageMiddleware:
             f"POST {settings.api_v1}/providers/{{provider}}/webhooks",
         }
 
+    def test_webhook_path_token_is_counted_as_its_placeholder(self) -> None:
+        path = f"{settings.api_v1}/providers/garmin/webhooks/t/path-secret-123"
+        params = {"provider": "garmin", "token": "path-secret-123"}
+
+        assert _path_template(path, params) == f"{settings.api_v1}/providers/garmin/webhooks/t/{{token}}"
+        legacy = f"{settings.api_v1}/garmin/webhooks/push/t/path-secret-123"
+        assert (
+            _path_template(legacy, {"token": "path-secret-123"})
+            == f"{settings.api_v1}/garmin/webhooks/push/t/{{token}}"
+        )
+
     def test_nested_router_prefixes_are_part_of_the_template(self) -> None:
         client = _build_client()
         client.get(f"{settings.api_v1}/providers/oura/users/{USER_ID}/workouts/w-42")

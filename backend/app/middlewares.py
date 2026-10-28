@@ -17,31 +17,35 @@ from app.services.endpoint_usage import caller_type, endpoint_usage, route_key
 from app.utils.config_utils import AccessLogLevel
 from app.utils.sdk_request_metadata import sdk_request_metadata
 from app.utils.structured_logging import log_structured
+from app.utils.url_secrets import redact_path_secrets
 
 logger = logging.getLogger("app.access")
 
 # Query keys whose value authenticates a request and must never reach the logs.
 # Providers that sign inbound webhooks use a header instead; these three carry the
 # shared secret in the URL, so the provider replays it on every delivery:
-#   token              - Withings notify callback (unsigned notifications)
+#   token              - Withings notify callback (unsigned notifications), Garmin push URL token
 #   verification_token - Oura subscription verification
 #   hub.verify_token   - Strava subscription validation
+# Secrets carried in the path (Garmin's /webhooks/t/{token}) are masked by redact_path_secrets.
 _REDACTED_QUERY_KEYS = frozenset({"token", "verification_token", "hub.verify_token"})
 _REDACTED = "REDACTED"  # plain word: urlencode would percent-encode brackets
 
 
 def _log_path(request: Request) -> str:
-    """The request path with any secret-bearing query values masked."""
+    """The request path with any secret-bearing path segment or query value masked."""
+    # Garmin's push token can sit in the path (/webhooks/t/{token}); see app.utils.url_secrets.
+    path = redact_path_secrets(request.url.path, _REDACTED)
     query = request.url.query
     if not query:
-        return request.url.path
+        return path
     try:
         pairs = parse_qsl(query, keep_blank_values=True)
     except ValueError:
         # Unparseable query: drop it wholesale rather than risk logging a secret.
-        return f"{request.url.path}?{_REDACTED}"
+        return f"{path}?{_REDACTED}"
     masked = [(key, _REDACTED if key.lower() in _REDACTED_QUERY_KEYS else value) for key, value in pairs]
-    return f"{request.url.path}?{urlencode(masked)}"
+    return f"{path}?{urlencode(masked)}"
 
 
 def add_cors_middleware(app: FastAPI) -> None:

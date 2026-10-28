@@ -14,7 +14,7 @@ import pytest
 import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from sentry_sdk.envelope import Envelope
 from sentry_sdk.transport import Transport
 from sqlalchemy.exc import IntegrityError
@@ -257,6 +257,56 @@ def test_query_string_is_filtered_in_transactions_and_param_names(
     transaction = transport.transactions[-1]
     assert transaction["request"]["query_string"] == "email=[Filtered]&[Filtered]=[Filtered]"
     assert FAKE_EMAIL not in _dump(transaction)
+
+
+def _app_with_path_token_route() -> FastAPI:
+    app = FastAPI()
+
+    @app.post("/api/v1/providers/{provider}/webhooks/t/{token}")
+    async def webhook(provider: str, token: str) -> None:
+        raise RuntimeError("boom")
+
+    @app.post("/api/v1/garmin/webhooks/push/t/{token}")
+    async def legacy(token: str) -> None:
+        return None
+
+    return app
+
+
+def test_path_token_is_filtered_from_error_events(captured: list[dict[str, Any]]) -> None:
+    client = TestClient(_app_with_path_token_route(), raise_server_exceptions=False)
+    client.post(f"/api/v1/providers/garmin/webhooks/t/{FAKE_TOKEN}", json={})
+    sentry_sdk.flush()
+
+    event = captured[0]
+    assert event["request"]["url"].endswith("/api/v1/providers/garmin/webhooks/t/[Filtered]")
+    assert FAKE_TOKEN not in _dump(event)
+
+
+def test_path_token_is_filtered_from_transactions(
+    captured: list[dict[str, Any]], transport: _CapturingTransport
+) -> None:
+    client = TestClient(_app_with_path_token_route())
+    client.post(f"/api/v1/garmin/webhooks/push/t/{FAKE_TOKEN}", json={})
+    sentry_sdk.flush()
+
+    transaction = transport.transactions[-1]
+    assert FAKE_TOKEN not in _dump(transaction)
+
+
+@pytest.mark.parametrize("captured", [True], indirect=True)
+def test_path_token_is_filtered_in_sensitive_mode_too(
+    captured: list[dict[str, Any]], transport: _CapturingTransport
+) -> None:
+    # Frame locals ship in this mode; the configured secret is masked wherever it appears in them.
+    client = TestClient(_app_with_path_token_route(), raise_server_exceptions=False)
+    with patch.object(settings, "garmin_webhook_token", SecretStr(FAKE_TOKEN)):
+        client.post(f"/api/v1/providers/garmin/webhooks/t/{FAKE_TOKEN}", json={})
+        sentry_sdk.flush()
+
+    assert captured
+    for event in [*captured, *transport.transactions]:
+        assert FAKE_TOKEN not in _dump(event)
 
 
 def test_failed_s3_upload_adds_no_breadcrumb(captured: list[dict[str, Any]]) -> None:

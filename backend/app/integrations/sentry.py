@@ -10,6 +10,7 @@ from sentry_sdk.scrubber import DEFAULT_DENYLIST, DEFAULT_PII_DENYLIST, EventScr
 from app import __version__
 from app.config import settings
 from app.utils.structured_logging import log_structured
+from app.utils.url_secrets import redact_path_secrets
 
 if TYPE_CHECKING:
     from sentry_sdk._types import Event, Hint
@@ -75,8 +76,45 @@ def _scrub_text(value: Any) -> Any:
     return value
 
 
+# Shorter values could be ordinary words; a configured URL secret is far longer.
+_MIN_SECRET_LENGTH = 8
+
+
+def _url_secrets() -> list[str]:
+    """Shared secrets providers send back in our webhook URLs (path or query)."""
+    configured = (settings.garmin_webhook_token, settings.withings_webhook_token)
+    values = [secret.get_secret_value() for secret in configured if secret is not None]
+    return [value for value in values if len(value) >= _MIN_SECRET_LENGTH]
+
+
+def _redact_url_secrets(value: Any, secrets: list[str]) -> Any:
+    if isinstance(value, str):
+        value = redact_path_secrets(value, FILTERED)
+        for secret in secrets:
+            value = value.replace(secret, FILTERED)
+        return value
+    if isinstance(value, dict):
+        return {k: _redact_url_secrets(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_url_secrets(v, secrets) for v in value]
+    return value
+
+
+def mask_url_secrets(event: "Event", hint: "Hint") -> "Event":
+    """Mask webhook tokens carried in the request URL (Garmin's /webhooks/t/{token}).
+
+    Runs in every mode, SENTRY_SEND_SENSITIVE_DATA included: like other credentials, the token is
+    never shipped. Besides the request URL, the token shows up in frame locals in sensitive mode
+    (the ASGI scope's path, reprs of FastAPI's resolved parameters), so every string in the event
+    is checked for the path form and for the configured secret values themselves. Transaction
+    names use the route template.
+    """
+    return _redact_url_secrets(event, _url_secrets())
+
+
 def before_send(event: "Event", hint: "Hint") -> "Event":
     """Filter free text that the key-based scrubber can't see."""
+    event = mask_url_secrets(event, hint)
     # `contexts` is where log_and_capture_error puts `extra` - EventScrubber skips it.
     for key in ("message", "logentry", "contexts", "extra"):
         if key in event:
@@ -126,8 +164,8 @@ def init_sentry() -> None:
         include_local_variables=sensitive,
         max_request_body_size="medium" if sensitive else "never",
         event_scrubber=_credentials_scrubber if sensitive else _scrubber,
-        before_send=None if sensitive else before_send,
-        # Sampled transactions carry the request (query string) too but skip before_send.
-        before_send_transaction=None if sensitive else before_send,
+        before_send=mask_url_secrets if sensitive else before_send,
+        # Sampled transactions carry the request (URL, query string) too but skip before_send.
+        before_send_transaction=mask_url_secrets if sensitive else before_send,
         integrations=integrations,
     )

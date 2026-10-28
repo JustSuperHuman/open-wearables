@@ -42,6 +42,7 @@ from fastapi import HTTPException, Request
 
 from app.database import DbSession
 from app.utils.structured_logging import log_structured
+from app.utils.url_secrets import redact_path_secrets
 
 
 class BaseWebhookHandler(ABC):
@@ -69,6 +70,12 @@ class BaseWebhookHandler(ABC):
     #: Top-level webhook-payload key holding the provider-side user id.
     #: Override extract_user_id() instead when it isn't a flat field (e.g. Garmin).
     user_id_field: str | None = None
+
+    #: Whether the provider's webhook URL may carry a shared token as its last path segment
+    #: (``.../webhooks/t/{token}``), for providers whose portal drops query strings. The handler
+    #: reads it from ``request.path_params["token"]`` in ``verify_signature``; for any other
+    #: provider the token route answers 404.
+    accepts_path_token: bool = False
 
     def __init__(self, provider_name: str) -> None:
         self.provider_name = provider_name
@@ -212,7 +219,7 @@ class BaseWebhookHandler(ABC):
                 "warning",
                 "Webhook signature verification failed",
                 provider=self.provider_name,
-                path=request.url.path,
+                path=redact_path_secrets(request.url.path),
                 client_host=request.client.host if request.client else None,
             )
             raise HTTPException(status_code=401, detail="Invalid webhook signature")

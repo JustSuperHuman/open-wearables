@@ -299,3 +299,146 @@ class TestGarminWebhookUrlToken:
     def test_required_without_a_token_fails_at_startup(self) -> None:
         with pytest.raises(ValidationError, match="GARMIN_WEBHOOK_TOKEN"):
             Settings(garmin_webhook_token_required=True, garmin_webhook_token=None)
+
+
+PATH_TOKEN_ENDPOINTS = [
+    "/api/v1/providers/garmin/webhooks/t/{token}",
+    "/api/v1/garmin/webhooks/push/t/{token}",
+    "/api/v1/garmin/webhooks/ping/t/{token}",
+]
+
+
+class TestGarminWebhookPathToken:
+    """The token as the last path segment: Garmin's portal drops query strings from push URLs."""
+
+    @pytest.fixture
+    def token_configured(self) -> Generator[None, None, None]:
+        with patch.object(settings, "garmin_webhook_token", SecretStr(URL_TOKEN)):
+            yield
+
+    @pytest.fixture
+    def token_required(self, token_configured: None) -> Generator[None, None, None]:
+        with patch.object(settings, "garmin_webhook_token_required", True):
+            yield
+
+    @pytest.mark.parametrize("endpoint", PATH_TOKEN_ENDPOINTS)
+    def test_required_token_accepts_the_right_one(
+        self,
+        client: TestClient,
+        db: Session,
+        token_required: None,
+        mock_external_apis: dict[str, MagicMock],
+        endpoint: str,
+    ) -> None:
+        response = client.post(
+            endpoint.format(token=URL_TOKEN), headers={"garmin-client-id": VALID_CLIENT_ID}, json={"activities": []}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "accepted"}
+
+    @pytest.mark.parametrize("endpoint", PATH_TOKEN_ENDPOINTS)
+    def test_required_token_rejects_a_wrong_one(
+        self, client: TestClient, db: Session, token_required: None, endpoint: str
+    ) -> None:
+        response = client.post(
+            endpoint.format(token="guessed"), headers={"garmin-client-id": VALID_CLIENT_ID}, json={"activities": []}
+        )
+        assert response.status_code == 401
+
+    def test_client_id_is_still_checked(self, client: TestClient, db: Session, token_required: None) -> None:
+        response = client.post(
+            PATH_TOKEN_ENDPOINTS[0].format(token=URL_TOKEN), headers={"garmin-client-id": "wrong"}, json={}
+        )
+        assert response.status_code == 401
+
+    def test_query_token_still_accepted(
+        self,
+        client: TestClient,
+        db: Session,
+        token_required: None,
+        mock_external_apis: dict[str, MagicMock],
+    ) -> None:
+        response = client.post(
+            f"{PUSH_ENDPOINT}?token={URL_TOKEN}", headers={"garmin-client-id": VALID_CLIENT_ID}, json={}
+        )
+        assert response.status_code == 200
+
+    def test_either_form_matching_is_enough(
+        self,
+        client: TestClient,
+        db: Session,
+        token_required: None,
+        mock_external_apis: dict[str, MagicMock],
+    ) -> None:
+        response = client.post(
+            f"{PATH_TOKEN_ENDPOINTS[0].format(token='stale')}?token={URL_TOKEN}",
+            headers={"garmin-client-id": VALID_CLIENT_ID},
+            json={},
+        )
+        assert response.status_code == 200
+
+    def test_non_ascii_path_token_is_rejected_not_an_error(
+        self, client: TestClient, db: Session, token_required: None
+    ) -> None:
+        response = client.post(
+            PATH_TOKEN_ENDPOINTS[0].format(token="%C3%A9t%C3%A9"),
+            headers={"garmin-client-id": VALID_CLIENT_ID},
+            json={},
+        )
+        assert response.status_code == 401
+
+    def test_optional_token_accepts_a_wrong_one_with_a_warning(
+        self,
+        client: TestClient,
+        db: Session,
+        token_configured: None,
+        mock_external_apis: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        response = client.post(
+            PATH_TOKEN_ENDPOINTS[0].format(token="stale-path-token"),
+            headers={"garmin-client-id": VALID_CLIENT_ID},
+            json={},
+        )
+
+        assert response.status_code == 200
+        logged = capsys.readouterr().out
+        assert "Accepted Garmin push without a valid URL token" in logged
+        assert "stale-path-token" not in logged
+        assert "/webhooks/t/REDACTED" in logged
+
+    def test_access_log_masks_the_path_token(
+        self,
+        client: TestClient,
+        db: Session,
+        token_required: None,
+        mock_external_apis: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        for endpoint in PATH_TOKEN_ENDPOINTS:
+            client.post(endpoint.format(token=URL_TOKEN), headers={"garmin-client-id": VALID_CLIENT_ID}, json={})
+        client.post(PATH_TOKEN_ENDPOINTS[0].format(token="attacker-guess"), json={})
+
+        logged = capsys.readouterr().out
+        assert URL_TOKEN not in logged
+        assert "attacker-guess" not in logged
+        assert '"path": "/api/v1/providers/garmin/webhooks/t/REDACTED"' in logged
+        assert '"path": "/api/v1/garmin/webhooks/push/t/REDACTED"' in logged
+        # The failed-verification log of the base handler is masked too.
+        assert "Webhook signature verification failed" in logged
+
+    def test_other_providers_have_no_token_route(self, client: TestClient, db: Session) -> None:
+        response = client.post("/api/v1/providers/oura/webhooks/t/anything", json={})
+        assert response.status_code == 404
+
+    def test_subscription_routes_are_not_shadowed(self, client: TestClient, db: Session) -> None:
+        # Still the developer-only subscription endpoint (401 without a developer token), not a push.
+        with patch(f"{WEBHOOK_HANDLER}.celery_app") as celery:
+            response = client.post(
+                "/api/v1/providers/garmin/webhooks/subscriptions",
+                params={"callback_url": "https://example.com"},
+                headers={"garmin-client-id": VALID_CLIENT_ID},
+                json={},
+            )
+        assert response.status_code == 401
+        celery.send_task.assert_not_called()

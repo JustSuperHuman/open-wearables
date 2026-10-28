@@ -291,12 +291,17 @@ bun run deploy secrets redis svix api flower frontend
   `refresh-garmin-tokens-hourly`, which keeps Garmin refresh tokens (90-day life)
   from expiring for users who only ever push data. Without it those connections
   turn `expired` after three months.
-- Garmin push URL token: `fly secrets set GARMIN_WEBHOOK_TOKEN=$(openssl rand -hex 32)`
-  (leave `GARMIN_WEBHOOK_TOKEN_REQUIRED` unset), deploy, change every endpoint in
-  Garmin's API Tools to
-  `https://wearables.api.justgains.com/api/v1/providers/garmin/webhooks?token=<token>`,
-  wait until the API logs stop showing `webhook_token_not_enforced`, then
-  `fly secrets set GARMIN_WEBHOOK_TOKEN_REQUIRED=true`. Details in
+- Garmin push URL token. Garmin's API Tools drops query strings when it saves an
+  endpoint URL, so the token goes in the path:
+  1. `fly secrets set GARMIN_WEBHOOK_TOKEN=$(openssl rand -hex 32) -a open-wearables-api`
+     (leave `GARMIN_WEBHOOK_TOKEN_REQUIRED` unset) and deploy.
+  2. Change every enabled endpoint in Garmin's API Tools to
+     `https://wearables.api.justgains.com/api/v1/providers/garmin/webhooks/t/<token>`,
+     then reopen the page and check the saved URL still ends in `/t/<token>`.
+  3. Wait until the API logs stop showing `webhook_token_not_enforced`.
+  4. `fly secrets set GARMIN_WEBHOOK_TOKEN_REQUIRED=true -a open-wearables-api`.
+
+  Logs and Sentry show the path token as `REDACTED` / `[Filtered]`. Details in
   `docs/providers/garmin-api-integration.mdx` ("Securing the push URL").
 - If the web machine hits its restart limit during a deploy, roll back with
   `fly deploy --image registry.fly.io/open-wearables-api:<previous tag>` (tags from

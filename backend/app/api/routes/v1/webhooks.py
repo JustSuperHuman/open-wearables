@@ -111,6 +111,26 @@ def handle_provider_webhook(
     return handler.handle(request, body, db)
 
 
+@router.post("/t/{token}")
+def handle_provider_webhook_with_path_token(
+    provider: str,
+    token: str,
+    request: Request,
+    db: DbSession,
+    body: Annotated[bytes, Depends(_read_body)],
+) -> dict:
+    """Receive a webhook whose registered URL carries the shared token as its last path segment.
+
+    For providers whose portal drops query strings (Garmin), so ``?token=`` can't be used. The
+    handler verifies ``token`` like it verifies the query form; access logs and Sentry mask it.
+    Only providers whose handler sets ``accepts_path_token`` answer here; others get 404.
+    """
+    handler = _get_webhook_handler(provider)
+    if not handler.accepts_path_token:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    return handler.handle(request, body, db)
+
+
 @router.get("")
 def verify_provider_webhook(provider: str, request: Request) -> dict:
     """Handle GET-based subscription verification challenges.

@@ -12054,6 +12054,60 @@
         }
       }
     },
+    "/api/v1/providers/{provider}/webhooks/t/{token}": {
+      "post": {
+        "tags": [
+          "System: Provider Webhooks"
+        ],
+        "summary": "Handle Provider Webhook With Path Token",
+        "description": "Receive a webhook whose registered URL carries the shared token as its last path segment.\n\nFor providers whose portal drops query strings (Garmin), so ``?token=`` can't be used. The\nhandler verifies ``token`` like it verifies the query form; access logs and Sentry mask it.\nOnly providers whose handler sets ``accepts_path_token`` answer here; others get 404.",
+        "operationId": "handle_provider_webhook_with_path_token_api_v1_providers__provider__webhooks_t__token__post",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider"
+            }
+          },
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Handle Provider Webhook With Path Token Api V1 Providers  Provider  Webhooks T  Token  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/providers/{provider}/webhooks/subscriptions": {
       "get": {
         "tags": [
@@ -12433,6 +12487,98 @@
           }
         },
         "deprecated": true
+      }
+    },
+    "/api/v1/garmin/webhooks/ping/t/{token}": {
+      "post": {
+        "tags": [
+          "System: Provider Webhooks (Deprecated)"
+        ],
+        "summary": "Garmin Webhook Ping Compat With Path Token",
+        "description": "Deprecated: POST /api/v1/garmin/webhooks/ping/t/{token}.\n\nUse POST /api/v1/providers/garmin/webhooks/t/{token} instead.",
+        "operationId": "garmin_webhook_ping_compat_with_path_token_api_v1_garmin_webhooks_ping_t__token__post",
+        "deprecated": true,
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Garmin Webhook Ping Compat With Path Token Api V1 Garmin Webhooks Ping T  Token  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/garmin/webhooks/push/t/{token}": {
+      "post": {
+        "tags": [
+          "System: Provider Webhooks (Deprecated)"
+        ],
+        "summary": "Garmin Webhook Push Compat With Path Token",
+        "description": "Deprecated: POST /api/v1/garmin/webhooks/push/t/{token}.\n\nUse POST /api/v1/providers/garmin/webhooks/t/{token} instead.",
+        "operationId": "garmin_webhook_push_compat_with_path_token_api_v1_garmin_webhooks_push_t__token__post",
+        "deprecated": true,
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Garmin Webhook Push Compat With Path Token Api V1 Garmin Webhooks Push T  Token  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/strava/webhook": {

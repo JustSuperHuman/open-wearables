@@ -74,6 +74,38 @@ def garmin_webhook_push_compat(
     return handler.handle(request, body, db)
 
 
+# The path-token form of the two routes above, for portals still pointing at them. The handler
+# reads ``token`` from the path params; access logs and Sentry mask it.
+@router.post("/garmin/webhooks/ping/t/{token}")
+def garmin_webhook_ping_compat_with_path_token(
+    token: str,
+    request: Request,
+    db: DbSession,
+    body: Annotated[bytes, Depends(_read_body)],
+) -> dict:
+    """Deprecated: POST /api/v1/garmin/webhooks/ping/t/{token}.
+
+    Use POST /api/v1/providers/garmin/webhooks/t/{token} instead.
+    """
+    handler = _get_garmin_handler()
+    return handler.handle(request, body, db)
+
+
+@router.post("/garmin/webhooks/push/t/{token}")
+def garmin_webhook_push_compat_with_path_token(
+    token: str,
+    request: Request,
+    db: DbSession,
+    body: Annotated[bytes, Depends(_read_body)],
+) -> dict:
+    """Deprecated: POST /api/v1/garmin/webhooks/push/t/{token}.
+
+    Use POST /api/v1/providers/garmin/webhooks/t/{token} instead.
+    """
+    handler = _get_garmin_handler()
+    return handler.handle(request, body, db)
+
+
 # Oura and Strava — re-registered at old paths for completeness.
 # These were never in production at these paths.
 router.include_router(oura_webhooks_router, prefix="/oura/webhooks")
