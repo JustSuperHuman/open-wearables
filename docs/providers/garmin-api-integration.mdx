@@ -139,6 +139,8 @@ Garmin describes both business tiers as intended for organizations (company, uni
     https://<your-ngrok-id>.ngrok-free.app/api/v1/garmin/webhooks/push
     ```
 
+    In production, add a shared secret to the URL so only Garmin can post to it. See [Securing the push URL](#securing-the-push-url).
+
     - Set delivery type to **push** (dropdown on the right)
     - Check **enabled** for each endpoint you want to activate
     - All endpoints use the **same URL** — Garmin distinguishes data types internally and sends the appropriate payload to this single endpoint
@@ -192,6 +194,16 @@ GARMIN_BACKFILL_ENABLED=false
 
 # Source name Garmin Connect shows on workouts you push (max 20 characters, default: JustGains)
 GARMIN_WORKOUT_PROVIDER=YourApp
+
+# Shared secret on the push URLs (?token=...). See "Securing the push URL".
+GARMIN_WEBHOOK_TOKEN=generate-with-openssl-rand-hex-32
+GARMIN_WEBHOOK_TOKEN_REQUIRED=false
+
+# Optional tuning (defaults shown)
+GARMIN_REFRESH_TOKEN_MAX_AGE_DAYS=60      # refresh tokens older than this are refreshed hourly
+GARMIN_WRITE_TIMEOUT_SECONDS=20           # total time budget of one workout/schedule/course request
+GARMIN_WRITE_CALL_TIMEOUT_SECONDS=10      # longest wait for a single Garmin call
+GARMIN_WRITE_CONCURRENCY=8                # Garmin write requests running at once
 ```
 
     <Note>
@@ -228,6 +240,50 @@ With the flag off:
 
 The flag defaults to `true`, which keeps the Enterprise behaviour described above.
 
+## Securing the push URL
+
+Garmin doesn't sign its pushes. It identifies itself with a `garmin-client-id` header, and Open Wearables rejects any push whose header doesn't match `GARMIN_CLIENT_ID`. Your client id isn't a secret, though: it's in every OAuth link your users open. To make sure a push really comes from Garmin, put a shared token in the URLs you register in Garmin's portal. Garmin posts to each URL as registered, query string included, so the token arrives with every push.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `GARMIN_WEBHOOK_TOKEN` | unset | The token expected in `?token=`, compared in constant time. Store it as a secret. |
+| `GARMIN_WEBHOOK_TOKEN_REQUIRED` | `false` | `true`: a push without the right token gets `401`, on top of the client id check. `false`: the push is accepted and a warning is logged (without the token). |
+
+Open Wearables refuses to start with `GARMIN_WEBHOOK_TOKEN_REQUIRED=true` and no token, since that would reject every push. The check covers every Garmin push route: `/api/v1/providers/garmin/webhooks` and the older `/api/v1/garmin/webhooks/push` and `/ping`. Access logs mask `token` values.
+
+Roll it out in this order so no push is rejected while Garmin still uses the old URLs:
+
+<Steps>
+  <Step title="Set the token, not yet required">
+    ```bash
+    GARMIN_WEBHOOK_TOKEN=$(openssl rand -hex 32)
+    GARMIN_WEBHOOK_TOKEN_REQUIRED=false
+    ```
+    Deploy. Pushes keep working with or without the token.
+  </Step>
+  <Step title="Update every endpoint URL in Garmin's portal">
+    In [API Endpoints](https://apis.garmin.com/tools/endpoints), change each enabled endpoint to:
+    ```
+    https://<your-domain>/api/v1/providers/garmin/webhooks?token=<GARMIN_WEBHOOK_TOKEN>
+    ```
+    Use a token of hex characters (as `openssl rand -hex 32` gives you) so it needs no URL encoding.
+  </Step>
+  <Step title="Confirm Garmin sends the token">
+    Wait for a few pushes, then check the API logs: `Accepted Garmin push without a valid URL token` (action `webhook_token_not_enforced`) should no longer appear.
+  </Step>
+  <Step title="Enforce it">
+    Set `GARMIN_WEBHOOK_TOKEN_REQUIRED=true` and redeploy.
+  </Step>
+</Steps>
+
+To rotate the token, repeat the steps with `GARMIN_WEBHOOK_TOKEN_REQUIRED=false` while you change the URLs.
+
+## Keeping Garmin connections alive
+
+A Garmin access token lasts 24 hours, and its refresh token expires 90 days after it's issued. Every refresh issues a new pair. Pushes don't need a token, so a user who never writes to Garmin could leave theirs untouched long enough to die. An hourly job (`refresh-garmin-tokens-hourly` in Celery beat) refreshes any token older than `GARMIN_REFRESH_TOKEN_MAX_AGE_DAYS` (60). Running it more often, or twice at once, is harmless. The same job fills in the Garmin user id of any connection that was saved without one because Garmin didn't answer at connect time; a lookup is also queued right after such a connect.
+
+When Garmin rejects a refresh token, or rejects a freshly refreshed access token, the connection's status becomes `expired` and a `connection.revoked` webhook goes out with `reason` `refresh_failed` or `unauthorized`. An expired Garmin connection still receives and stores everything Garmin pushes, because only a deregistration ends the user's consent. Writes answer `garmin_not_connected` until the user reconnects Garmin, which sets the connection back to `active`. A deregistration push revokes both active and expired connections.
+
 ## Pushing workouts, schedules and courses
 
 If your app has the Training API and Courses API enabled, Open Wearables can write to a user's Garmin Connect account for you. Your backend never handles Garmin tokens: it calls these endpoints with your Open Wearables API key, and Open Wearables makes the Garmin call with the stored connection, refreshing the token when needed.
@@ -243,7 +299,7 @@ If your app has the Training API and Courses API enabled, Open Wearables can wri
 | `POST` | `/api/v1/users/{user_id}/garmin/courses` | `COURSE_IMPORT` | `201` |
 | `DELETE` | `/api/v1/users/{user_id}/garmin/courses/{course_id}` | `COURSE_IMPORT` | `204` |
 
-Users choose permissions on Garmin's consent screen and can change them later in Garmin Connect, so check `/garmin/permissions` before offering "Send to Garmin". It reads the permissions live from Garmin, stores them on the connection, and falls back to the stored ones (kept current by Garmin's `userPermissionsChange` push) when Garmin can't be reached:
+Users choose permissions on Garmin's consent screen and can change them later in Garmin Connect, so check `/garmin/permissions` before offering "Send to Garmin". It reads the permissions live from Garmin and stores them on the connection. When Garmin can't be reached (a network error or a Garmin 5xx), it answers with the stored ones instead, which Garmin's `userPermissionsChange` push keeps current. A Garmin rate limit is answered as `garmin_rate_limited`, not hidden behind stored values.
 
 ```bash
 curl https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/permissions \
@@ -253,12 +309,15 @@ curl https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/g
 ```json
 {
   "connected": true,
+  "status": "active",
   "garmin_user_id": "7c2e91f04ab35d6e8f10c4a9b2d7e3f5",
   "permissions": ["ACTIVITY_EXPORT", "COURSE_IMPORT", "HEALTH_EXPORT", "MCT_EXPORT", "WORKOUT_IMPORT"]
 }
 ```
 
-A user without an active Garmin connection gets `{"connected": false, "garmin_user_id": null, "permissions": []}`.
+A user who never connected Garmin gets `{"connected": false, "status": null, "garmin_user_id": null, "permissions": []}`. `"connected": false` with `"status": "expired"` means Garmin stopped accepting the user's authorization (see [Keeping Garmin connections alive](#keeping-garmin-connections-alive)): their data keeps arriving, but ask them to reconnect Garmin before sending anything. An empty `permissions` list on a connected user means they switched every permission off.
+
+Permission changes pushed by Garmin carry the time of the change, and an older change arriving late never overwrites a newer one. They apply to every Open Wearables user linked to the same Garmin account.
 
 ### Workouts
 
@@ -303,9 +362,11 @@ curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c
 }
 ```
 
-`workout` is whatever Garmin returned. Keep `workout_id` to update, schedule or delete the workout later, and keep `ownerId` too: Garmin requires it on updates. If an update body leaves `ownerId` out, Open Wearables reads it from Garmin first, which costs one extra Garmin call. An update answers `200` with the same `{"workout_id", "workout"}` shape.
+`workout` is whatever Garmin returned. Keep `workout_id` to update, schedule or delete the workout later, and keep `ownerId` too: Garmin requires it on updates. An update replaces the whole workout. If its body leaves out `ownerId` or `workoutProvider`, Open Wearables reads the current workout from Garmin first (one extra Garmin call) and keeps its `ownerId`, `workoutProvider` and `workoutSourceId`; `GARMIN_WORKOUT_PROVIDER` only fills a provider the workout never had. An update answers `200` with the same `{"workout_id", "workout"}` shape, and `garmin_not_found` when Garmin has no such workout.
 
-Before calling Garmin, Open Wearables checks that `sport` is set and that the workout stays within Garmin's step limits: 100 steps for a single-sport workout, 25 segments and 250 steps for `MULTI_SPORT`. A repeat block counts as a step, and so does every step inside it. `workoutProvider` and `workoutSourceId` may be at most 20 characters. Everything else (step types, exercise categories and names, targets) is validated by Garmin; its message comes back in a `garmin_validation_error`. Garmin expects speed targets, pace included, in meters per second, so convert from min/mi before sending.
+In the rare case Garmin creates a workout without returning its id, the create still answers `201`, with `"workout_id": null` and whatever Garmin sent. Don't retry it: the workout exists in Garmin Connect. Schedules and courses behave the same way.
+
+Before calling Garmin, Open Wearables checks that `sport` is set and that the workout stays within Garmin's limits: a single-sport workout has one segment and at most 100 steps; `MULTI_SPORT` allows 25 segments and 250 steps. A repeat block counts as a step, and so does every step inside it. `workoutProvider` and `workoutSourceId` may be at most 20 characters. Everything else (step types, exercise categories and names, targets) is validated by Garmin; its message comes back in a `garmin_validation_error`. Garmin expects speed targets, pace included, in meters per second, so convert from min/mi before sending.
 
 ### Schedules
 
@@ -324,7 +385,7 @@ curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c
 
 ### Courses
 
-The body is a Garmin Courses API course object. Open Wearables checks for a non-empty `courseName`, at least one entry in `geoPoints`, and numeric `distance`, `elevationGain` and `elevationLoss` (meters), which Garmin doesn't accept as null.
+The body is a Garmin Courses API course object. Open Wearables checks for a non-empty `courseName`, between 1 and 10,000 entries in `geoPoints` (Garmin's limit; it suggests a point every 100 m at most), and numbers (not `null`, strings or booleans) for `distance`, `elevationGain` and `elevationLoss`, in meters.
 
 ```bash
 curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/courses \
@@ -351,9 +412,25 @@ curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c
 
 Deleting a workout, schedule or course answers `204`. One Garmin no longer has also answers `204`, so a retried delete is safe.
 
+### Retries and `Idempotency-Key`
+
+Each request gets `GARMIN_WRITE_TIMEOUT_SECONDS` (20 s) for all the Garmin calls it makes, and no single call waits longer than `GARMIN_WRITE_CALL_TIMEOUT_SECONDS` (10 s). When a create times out, your client can't know whether Garmin made the object. Send an `Idempotency-Key` header with every create (`POST` workouts, schedules and courses), a fresh value such as a UUID per object, and reuse it when you retry:
+
+```bash
+curl -X POST https://api.example.com/api/v1/users/4f6c9c2e-8a51-4c47-9d1e-2b7f0c3a9e11/garmin/schedules \
+  -H "X-Open-Wearables-API-Key: $OW_API_KEY" \
+  -H "Idempotency-Key: 6f1c2d8e-3b0a-4c55-9d2e-7a8b1c0f4e21" \
+  -H "Content-Type: application/json" \
+  -d '{"workout_id": 98765432, "date": "2026-11-03"}'
+```
+
+A retry with the same key within 24 hours gets the first response back (`201`, with an `Idempotent-Replayed: true` header) and nothing is created twice. Only successes are remembered: after an error, the same key runs the request again. Reusing a key with a different body, or while the first request is still running, answers `409 idempotency_conflict`. Keys are scoped to your API key, the user and the endpoint, and can be up to 255 characters.
+
+Garmin writes run on their own pool of `GARMIN_WRITE_CONCURRENCY` (8) workers, separate from the one that receives Garmin's pushes, so a slow Garmin can't hold up data ingestion. A request that can't get a worker within 5 seconds answers `503 garmin_busy` with `Retry-After`.
+
 ### Errors
 
-Every failure on these endpoints, request validation included, has the same shape:
+Every failure on these endpoints, authentication and request validation included, has the same shape:
 
 ```json
 {"detail": "The user hasn't granted WORKOUT_IMPORT to this app in Garmin Connect.", "code": "garmin_permission_missing"}
@@ -361,26 +438,35 @@ Every failure on these endpoints, request validation included, has the same shap
 
 | Status | `code` | When |
 |---|---|---|
-| `404` | `garmin_not_connected` | No active Garmin connection, or Garmin no longer accepts the stored authorization. Ask the user to reconnect. |
+| `401` | `unauthorized` | The Open Wearables API key is missing or invalid. |
+| `404` | `garmin_not_connected` | No active Garmin connection, or Garmin no longer accepts the user's authorization (the connection is now `expired`). Ask the user to reconnect. |
+| `404` | `garmin_not_found` | Garmin has no such workout, schedule or course for this user (update, or the `ownerId` lookup). Deletes of a missing object still answer `204`. |
 | `403` | `garmin_permission_missing` | The user hasn't granted the permission the call needs. A stored "not granted" is double-checked with Garmin before refusing. |
+| `403` | `garmin_forbidden` | Garmin refused the call itself (its HTTP 403, "Not allowed"). Garmin's message is in `detail`. |
+| `409` | `idempotency_conflict` | The `Idempotency-Key` was used for a different body, or its first request is still running. |
 | `422` | `garmin_validation_error` | The request failed Open Wearables' checks, or Garmin rejected it. Garmin's own message is in `detail`. |
-| `429` | `garmin_rate_limited` | Garmin's per-app or per-user rate limit was hit. `Retry-After` is passed on when Garmin sends it. Open Wearables doesn't retry for you. |
-| `502` | `garmin_upstream_error` | Garmin failed, timed out, or answered something unexpected. Safe to retry later. |
+| `429` | `garmin_rate_limited` | Garmin's per-app or per-user rate limit was hit, including during a permission check. `Retry-After` is passed on when Garmin sends it. Open Wearables doesn't retry for you. |
+| `502` | `garmin_upstream_error` | Garmin failed, timed out, or answered something unexpected. Retry later, with the same `Idempotency-Key` for a create. |
+| `503` | `garmin_busy` | Too many Garmin writes in flight on this server. Retry after `Retry-After` seconds. |
 
-Garmin rate-limits Training and Courses API calls per app and per user, with tighter limits on Starter apps. The limits for your tier are in Garmin's Training API and Courses API specifications. Each `/garmin/permissions` call and each update without `ownerId` costs a Garmin call too, so cache permissions instead of checking before every write.
+When Garmin answers `401` to a token Open Wearables still considers valid, the token is refreshed once and the call retried. A second `401` marks the connection `expired` and answers `garmin_not_connected`.
+
+Garmin rate-limits Training and Courses API calls per app and per user, with tighter limits on Starter apps. The limits for your tier are in Garmin's Training API and Courses API specifications. Each `/garmin/permissions` call and each update without `ownerId` or `workoutProvider` costs a Garmin call too, so cache permissions instead of checking before every write.
 
 ## What Open Wearables stores from Garmin pushes
 
 Enable every endpoint in API Tools; anything Open Wearables doesn't store is acknowledged and dropped, so Garmin never retries it.
 
-- **Activities and activity details** become workouts. An activity the user edits in Garmin Connect arrives as `manuallyUpdatedActivities`, and the stored workout is updated in place: type, start, duration, distance, calories, heart rate and name. Fields the edit doesn't carry, such as laps from the FIT file, are kept.
-- **Nutrition** becomes daily totals of `dietary_energy_consumed`, `dietary_carbohydrates`, `dietary_fat_total` and `dietary_protein`. Individual foods aren't stored as meals because Garmin sends them without a timezone or an id.
+- **Activities and activity details** become workouts, with distance, calories, steps, average and max heart rate, average cadence (run, bike, swim or push), average and max speed, and total elevation gain. Times are stored in UTC.
+- **Edits.** An activity the user edits in Garmin Connect arrives as `manuallyUpdatedActivities`, and the stored workout is updated in place: type, start, duration, distance, calories, heart rate and name. Fields the edit doesn't carry, such as laps from the FIT file, are kept, and a `workout.updated` webhook goes out with the workout's new values under the id `workout.created` announced. A copy of the original summary arriving after the edit (Garmin redelivers, or a retried task) doesn't undo it. If the edit moves the activity onto exactly the time span of another workout from the same device, the edit isn't applied and the push result reports a `conflict`.
+- **Redeliveries.** Workouts are matched on the Garmin activity id first, so an activity Garmin sends twice stays one workout. A redelivery with different values updates it (and sends `workout.updated`); an identical one changes nothing and sends no webhook. `workout.created` goes out once, when the workout is first stored.
+- **Nutrition** becomes daily totals of `dietary_energy_consumed`, `dietary_carbohydrates`, `dietary_fat_total` and `dietary_protein`. Individual foods aren't stored as meals because Garmin sends them without a timezone or an id. Each summary is the whole day, so a macro it leaves out is stored as 0 for that day: after the user deletes the only food with fat in it, the day's fat total drops to 0 instead of keeping the old number.
 - **Hydration** becomes a daily `hydration` total in mL.
 - **Breathing variations** aren't stored: no series type fits a breathing-variation level. With `RAW_PAYLOAD_STORAGE` enabled the raw push is kept like every other Garmin push.
 
 ### Device attribution
 
-Garmin's brand guidelines ask for a "Garmin [device model]" attribution next to Garmin data. Workouts carry the model in `source.device`, taken from the `deviceName` Garmin sends with each activity. Per-second workout samples (with `INGEST_WORKOUT_SAMPLES=true`) are filed under the same device. Daily summaries, sleep, HRV, stress, nutrition and the other Health API data come without a device name, so their `source.device` is `null`; show plain "Garmin" for those, as the guidelines ask. Activities typed into Garmin Connect report their device as `unknown`, which Open Wearables stores as `null` too.
+Garmin's brand guidelines ask for a "Garmin [device model]" attribution next to Garmin data. Workouts carry the model in `source.device`, taken from the `deviceName` Garmin sends with each activity. Per-second workout samples (with `INGEST_WORKOUT_SAMPLES=true`) are filed under the same device. Garmin doesn't always spell a device the same way (activity details and FIT files can differ in case, e.g. "Garmin fenix 8" and "Garmin Fenix 8"), so the first spelling stored for a user is kept and later ones that differ only in case are filed under it. Daily summaries, sleep, HRV, stress, nutrition and the other Health API data come without a device name, so their `source.device` is `null`; show plain "Garmin" for those, as the guidelines ask. Activities typed into Garmin Connect report their device as `unknown`, which Open Wearables stores as `null` too.
 
 # Managin your team
 In the developer portal you can add team members who need access to specifications, internal tools, app credentials, source code, etc. You can manage your team at https://developerportal.garmin.com/teams, or use the Switch company menu (available on most developer portal pages) and select "Manage Company".

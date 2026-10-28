@@ -287,6 +287,17 @@ bun run deploy secrets redis svix api flower frontend
   `fly status -a open-wearables-api` and `fly machine start <id>` any `worker` or
   `beat` machine that isn't `started`. Without the worker, provider webhooks
   (Garmin pushes, Strava events) only queue up in Redis.
+- Keep the `beat` machine running: besides the periodic syncs it runs
+  `refresh-garmin-tokens-hourly`, which keeps Garmin refresh tokens (90-day life)
+  from expiring for users who only ever push data. Without it those connections
+  turn `expired` after three months.
+- Garmin push URL token: `fly secrets set GARMIN_WEBHOOK_TOKEN=$(openssl rand -hex 32)`
+  (leave `GARMIN_WEBHOOK_TOKEN_REQUIRED` unset), deploy, change every endpoint in
+  Garmin's API Tools to
+  `https://wearables.api.justgains.com/api/v1/providers/garmin/webhooks?token=<token>`,
+  wait until the API logs stop showing `webhook_token_not_enforced`, then
+  `fly secrets set GARMIN_WEBHOOK_TOKEN_REQUIRED=true`. Details in
+  `docs/providers/garmin-api-integration.mdx` ("Securing the push URL").
 - If the web machine hits its restart limit during a deploy, roll back with
   `fly deploy --image registry.fly.io/open-wearables-api:<previous tag>` (tags from
   `fly releases --image -a open-wearables-api`), then `fly machine start` the

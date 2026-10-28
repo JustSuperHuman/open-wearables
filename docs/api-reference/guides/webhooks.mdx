@@ -203,7 +203,8 @@ Fired once when a complete session is saved or merged.
 |-------|-------------|
 | `connection.created` | A user successfully connected a wearable provider. For OAuth providers this fires when authorization completes; SDK providers have no OAuth callback, so it fires when the first data upload arrives, and again when a previously revoked SDK connection resumes uploading. |
 | `connection.revoked` | A connection became invalid or was disconnected (refresh token expired/revoked, the user deregistered on the provider side, or the user manually disconnected). OAuth connections require re-authorization to resume syncing; SDK connections resume on the next upload. See the `reason` field. |
-| `workout.created` | A new workout session was saved. |
+| `workout.created` | A new workout session was saved. Fires once per workout; a provider re-sending a workout already stored doesn't fire it again. |
+| `workout.updated` | A saved workout changed, e.g. the user edited the activity at the provider (Garmin Connect edits). Same payload as `workout.created`, with the workout's current values under the same `id`. |
 | `sleep.created` | A new (or merged) sleep session was saved. |
 | `meal.created` | A new meal or nutrition-log entry was saved. |
 | `menstrual_cycle.created` | A new menstrual cycle record was saved. |
@@ -307,6 +308,35 @@ Every payload envelope has `type` (the event name as a string) and `data`.
 <Note>
   Fields like `calories_kcal`, `distance_meters`, and heart-rate fields are `null` when the provider did not report them.
 </Note>
+
+### `workout.updated`
+
+Sent when a stored workout changes, for example after the user shortens an activity in Garmin Connect. `id` is the one `workout.created` announced, so update your copy in place. The payload is the whole workout as it is now, not a diff.
+
+```json
+{
+  "type": "workout.updated",
+  "data": {
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "type": "running",
+    "start_time": "2025-12-19T07:30:00+01:00",
+    "end_time": "2025-12-19T08:20:00+01:00",
+    "zone_offset": "+01:00",
+    "duration_seconds": 3000.0,
+    "source": {
+      "provider": "garmin",
+      "device": "Forerunner 255"
+    },
+    "calories_kcal": 410.0,
+    "distance_meters": 8500.0,
+    "avg_heart_rate_bpm": 158,
+    "max_heart_rate_bpm": 182,
+    "avg_pace_sec_per_km": 353,
+    "elevation_gain_meters": 95.0
+  }
+}
+```
 
 ### `sleep.created`
 
