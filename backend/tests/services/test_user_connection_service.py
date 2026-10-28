@@ -14,8 +14,10 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
+from app.services.providers.api_client import get_valid_token
 from app.services.user_connection_service import user_connection_service
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -519,6 +521,36 @@ class TestUserConnectionServiceDeregisterFromProvider:
 
         oauth.refresh_access_token.assert_not_called()
         oauth.deregister_user.assert_called_once_with("valid", provider_user_id=connection.provider_user_id)
+
+    def test_token_expiring_within_ten_minutes_is_refreshed(self, db: Session) -> None:
+        # Garmin asks for a refresh at least 600 s before expiry.
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="nearly-expired",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=8),
+        )
+        oauth = MagicMock()
+        oauth.refresh_access_token.return_value.access_token = "fresh"
+
+        assert get_valid_token(db, user.id, "garmin", UserConnectionRepository(), oauth) == "fresh"
+        oauth.refresh_access_token.assert_called_once_with(
+            db, user.id, connection.refresh_token, revoke_on_failure=True
+        )
+
+    def test_token_valid_beyond_ten_minutes_is_kept(self, db: Session) -> None:
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="still-good",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=12),
+        )
+        oauth = MagicMock()
+
+        assert get_valid_token(db, user.id, "garmin", UserConnectionRepository(), oauth) == "still-good"
+        oauth.refresh_access_token.assert_not_called()
 
     def test_refresh_failure_skips_deregistration_without_raising(self, db: Session) -> None:
         user = UserFactory()

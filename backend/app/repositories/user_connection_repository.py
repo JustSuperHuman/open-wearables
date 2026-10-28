@@ -118,7 +118,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         )
 
     def _active_by_provider_external_id(
-        self, db_session: DbSession, provider: str, provider_user_id: str
+        self,
+        db_session: DbSession,
+        provider: str,
+        provider_user_id: str,
+        statuses: tuple[ConnectionStatus, ...] = (ConnectionStatus.ACTIVE,),
     ) -> Query[UserConnection]:
         """Base query: active connections for a given (provider, provider_user_id) pair.
 
@@ -132,7 +136,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                 and_(
                     self.model.provider == provider,
                     self.model.provider_user_id == provider_user_id,
-                    self.model.status == ConnectionStatus.ACTIVE,
+                    self.model.status.in_(statuses),
                 )
             )
             .order_by(self.model.created_at.asc(), self.model.id.asc())
@@ -143,13 +147,22 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session: DbSession,
         provider: str,
         provider_user_id: str,
+        *,
+        include_expired: bool = False,
     ) -> list[UserConnection]:
         """Get all active connections sharing the same external provider account.
 
         Used for multi-account sync fan-out: one provider account connected to
         several OpenWearables profiles.
+
+        ``include_expired`` adds connections whose tokens the provider rejected (status EXPIRED).
+        Providers that push data without needing our token (Garmin) keep delivering for those
+        until the user withdraws consent, so their webhook handlers still store it.
         """
-        return self._active_by_provider_external_id(db_session, provider, provider_user_id).all()
+        statuses = [ConnectionStatus.ACTIVE]
+        if include_expired:
+            statuses.append(ConnectionStatus.EXPIRED)
+        return self._active_by_provider_external_id(db_session, provider, provider_user_id, tuple(statuses)).all()
 
     def get_by_provider_user_id(
         self,
@@ -252,6 +265,49 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
+    def get_active_with_tokens_expiring_before(
+        self, db_session: DbSession, provider: str, before: datetime
+    ) -> list[UserConnection]:
+        """Active connections of ``provider`` holding a refresh token whose access token expires before ``before``."""
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.provider == provider,
+                    self.model.status == ConnectionStatus.ACTIVE,
+                    self.model.refresh_token.is_not(None),
+                    self.model.token_expires_at < before,
+                ),
+            )
+            .order_by(self.model.token_expires_at.asc())
+            .all()
+        )
+
+    def get_active_without_provider_user_id(self, db_session: DbSession, provider: str) -> list[UserConnection]:
+        """Active token-based connections of ``provider`` whose provider-side user id was never stored."""
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.provider == provider,
+                    self.model.status == ConnectionStatus.ACTIVE,
+                    self.model.provider_user_id.is_(None),
+                    self.model.access_token.is_not(None),
+                ),
+            )
+            .all()
+        )
+
+    def update_provider_user_id(
+        self, db_session: DbSession, connection: UserConnection, provider_user_id: str
+    ) -> UserConnection:
+        connection.provider_user_id = provider_user_id
+        connection.updated_at = datetime.now(timezone.utc)
+        db_session.add(connection)
+        db_session.commit()
+        db_session.refresh(connection)
+        return connection
+
     def get_expiring_tokens(self, db_session: DbSession, minutes_threshold: int = 5) -> list[UserConnection]:
         """Get connections with tokens expiring soon (for background refresh)."""
         now = datetime.now(timezone.utc)
@@ -312,7 +368,10 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
 
     def mark_as_revoked(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
         """Mark connection as revoked (when refresh token fails)."""
-        connection.status = ConnectionStatus.REVOKED
+        return self.set_status(db_session, connection, ConnectionStatus.REVOKED)
+
+    def set_status(self, db_session: DbSession, connection: UserConnection, status: ConnectionStatus) -> UserConnection:
+        connection.status = status
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
@@ -365,9 +424,17 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-        if provider_user_id and not connection.provider_user_id:
+        # The new tokens belong to whichever provider account the user just authorized, which can
+        # differ from the one stored (reconnecting with another account). Webhooks are matched on
+        # these, so they follow the tokens; a lookup that failed (None) keeps the stored value.
+        if provider_user_id and connection.provider_user_id != provider_user_id:
+            if connection.provider_user_id:
+                logger.info(
+                    "Provider account changed on reconnect",
+                    extra={"provider": connection.provider, "connection_id": str(connection.id)},
+                )
             connection.provider_user_id = provider_user_id
-        if provider_username and not connection.provider_username:
+        if provider_username and connection.provider_username != provider_username:
             connection.provider_username = provider_username
         if scope and connection.scope != scope:
             connection.scope = scope

@@ -7,6 +7,8 @@ happens in the worker process.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import Any
@@ -64,6 +66,45 @@ def _dispatch(
         logger.warning("Could not enqueue webhook event %s", event_type, exc_info=True)
 
 
+def _workout_data(
+    *,
+    record_id: UUID,
+    user_id: UUID,
+    provider: str,
+    device: str | None,
+    workout_type: str | None,
+    start_time: str,
+    end_time: str,
+    zone_offset: str | None,
+    duration_seconds: float | None,
+    calories_kcal: float | None,
+    distance_meters: float | None,
+    avg_heart_rate_bpm: int | None,
+    max_heart_rate_bpm: int | None,
+    elevation_gain_meters: float | None,
+    avg_pace_sec_per_km: int | None,
+    sync: dict[str, str] | None,
+) -> dict[str, Any]:
+    """The ``data`` of workout.created and workout.updated: the workout as stored."""
+    return {
+        "id": str(record_id),
+        "user_id": str(user_id),
+        "type": workout_type,
+        "start_time": start_time,
+        "end_time": end_time,
+        "zone_offset": zone_offset,
+        "duration_seconds": duration_seconds,
+        "source": {"provider": provider, "device": device},
+        "calories_kcal": calories_kcal,
+        "distance_meters": distance_meters,
+        "avg_heart_rate_bpm": avg_heart_rate_bpm,
+        "max_heart_rate_bpm": max_heart_rate_bpm,
+        "avg_pace_sec_per_km": avg_pace_sec_per_km,
+        "elevation_gain_meters": elevation_gain_meters,
+        "sync": sync,
+    }
+
+
 def on_workout_created(
     *,
     record_id: UUID,
@@ -87,25 +128,80 @@ def on_workout_created(
         WebhookEventType.WORKOUT_CREATED,
         {
             "type": WebhookEventType.WORKOUT_CREATED,
-            "data": {
-                "id": str(record_id),
-                "user_id": str(user_id),
-                "type": workout_type,
-                "start_time": start_time,
-                "end_time": end_time,
-                "zone_offset": zone_offset,
-                "duration_seconds": duration_seconds,
-                "source": {"provider": provider, "device": device},
-                "calories_kcal": calories_kcal,
-                "distance_meters": distance_meters,
-                "avg_heart_rate_bpm": avg_heart_rate_bpm,
-                "max_heart_rate_bpm": max_heart_rate_bpm,
-                "avg_pace_sec_per_km": avg_pace_sec_per_km,
-                "elevation_gain_meters": elevation_gain_meters,
-                "sync": sync,
-            },
+            "data": _workout_data(
+                record_id=record_id,
+                user_id=user_id,
+                provider=provider,
+                device=device,
+                workout_type=workout_type,
+                start_time=start_time,
+                end_time=end_time,
+                zone_offset=zone_offset,
+                duration_seconds=duration_seconds,
+                calories_kcal=calories_kcal,
+                distance_meters=distance_meters,
+                avg_heart_rate_bpm=avg_heart_rate_bpm,
+                max_heart_rate_bpm=max_heart_rate_bpm,
+                elevation_gain_meters=elevation_gain_meters,
+                avg_pace_sec_per_km=avg_pace_sec_per_km,
+                sync=sync,
+            ),
         },
         idempotency_key=f"workout.created.{record_id}",
+        channels=[f"user.{user_id}"],
+    )
+
+
+def on_workout_updated(
+    *,
+    record_id: UUID,
+    user_id: UUID,
+    provider: str,
+    device: str | None,
+    workout_type: str | None,
+    start_time: str,
+    end_time: str,
+    zone_offset: str | None,
+    duration_seconds: float | None,
+    calories_kcal: float | None = None,
+    distance_meters: float | None = None,
+    avg_heart_rate_bpm: int | None = None,
+    max_heart_rate_bpm: int | None = None,
+    elevation_gain_meters: float | None = None,
+    avg_pace_sec_per_km: int | None = None,
+    sync: dict[str, str] | None = None,
+) -> None:
+    """Emit when a stored workout's values changed, e.g. the user edited the activity at the provider.
+
+    ``data`` has the workout.created shape with the workout as it is now; ``id`` is the id that
+    workout.created announced.
+    """
+    data = _workout_data(
+        record_id=record_id,
+        user_id=user_id,
+        provider=provider,
+        device=device,
+        workout_type=workout_type,
+        start_time=start_time,
+        end_time=end_time,
+        zone_offset=zone_offset,
+        duration_seconds=duration_seconds,
+        calories_kcal=calories_kcal,
+        distance_meters=distance_meters,
+        avg_heart_rate_bpm=avg_heart_rate_bpm,
+        max_heart_rate_bpm=max_heart_rate_bpm,
+        elevation_gain_meters=elevation_gain_meters,
+        avg_pace_sec_per_km=avg_pace_sec_per_km,
+        sync=sync,
+    )
+    # One workout can be updated many times: key on the new content, so a re-sent identical
+    # update is deduplicated by Svix but every real change is delivered.
+    content = {key: value for key, value in data.items() if key != "sync"}
+    digest = hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    _dispatch(
+        WebhookEventType.WORKOUT_UPDATED,
+        {"type": WebhookEventType.WORKOUT_UPDATED, "data": data},
+        idempotency_key=f"workout.updated.{record_id}.{digest}",
         channels=[f"user.{user_id}"],
     )
 

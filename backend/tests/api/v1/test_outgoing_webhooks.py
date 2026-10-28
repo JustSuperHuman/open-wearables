@@ -35,6 +35,7 @@ from app.services.outgoing_webhooks.events import (
     on_sync_data_type_finished,
     on_timeseries_batch_saved,
     on_workout_created,
+    on_workout_updated,
 )
 from app.services.timeseries_service import timeseries_service
 from app.utils.context import sync_run_context
@@ -99,6 +100,34 @@ class TestWebhookEmit:
         assert args.kwargs["args"][1]["data"]["calories_kcal"] == 450.0
         assert args.kwargs["args"][1]["data"]["distance_meters"] == 10000.0
         assert args.kwargs["args"][1]["data"]["avg_heart_rate_bpm"] == 155
+
+    @patch("app.services.outgoing_webhooks.events.celery_app")
+    def test_on_workout_updated_dispatches_each_distinct_version(self, mock_task: MagicMock) -> None:
+        uid, rid = uuid4(), uuid4()
+        fields: dict[str, Any] = {
+            "record_id": rid,
+            "user_id": uid,
+            "provider": "garmin",
+            "device": "Forerunner 965",
+            "workout_type": "running",
+            "start_time": "2026-01-01T00:00:00+00:00",
+            "end_time": "2026-01-01T00:30:00+00:00",
+            "zone_offset": "-05:00",
+            "duration_seconds": 1800,
+        }
+
+        on_workout_updated(**fields)
+        on_workout_updated(**{**fields, "duration_seconds": 1500, "end_time": "2026-01-01T00:25:00+00:00"})
+        on_workout_updated(**fields)
+
+        calls = mock_task.send_task.call_args_list
+        assert [c.kwargs["args"][0] for c in calls] == ["workout.updated"] * 3
+        assert calls[0].kwargs["args"][1]["data"]["id"] == str(rid)
+        assert calls[0].kwargs["kwargs"]["channels"] == [f"user.{uid}"]
+        keys = [c.kwargs["kwargs"]["idempotency_key"] for c in calls]
+        # Same content, same key (Svix drops the repeat); a real change gets a new one.
+        assert keys[0] == keys[2] != keys[1]
+        assert keys[0].startswith(f"workout.updated.{rid}.")
 
     @patch("app.services.outgoing_webhooks.events.celery_app")
     def test_on_sleep_created_dispatches(self, mock_task: MagicMock) -> None:
@@ -936,3 +965,17 @@ def test_event_type_sync_reads_every_page_before_deciding_what_to_create() -> No
     assert [c.args[0].iterator for c in client.event_type.list.call_args_list] == [None, "it_1"]
     client.event_type.create.assert_not_called()
     client.event_type.patch.assert_not_called()
+
+
+def test_event_type_sync_registers_workout_updated() -> None:
+    """The startup seed (scripts/init/seed_webhook_event_types.py) creates new types such as workout.updated."""
+    already = [evt for evt in WebhookEventType if evt is not WebhookEventType.WORKOUT_UPDATED]
+    client = MagicMock()
+    client.event_type.list.return_value = MagicMock(data=_event_types(already), done=True, iterator=None)
+
+    with patch("app.services.outgoing_webhooks.svix._client", client):
+        assert _register_event_types() is True
+
+    [create] = client.event_type.create.call_args_list
+    assert create.args[0].name == "workout.updated"
+    assert create.args[0].description == EVENT_TYPE_DESCRIPTIONS[WebhookEventType.WORKOUT_UPDATED]

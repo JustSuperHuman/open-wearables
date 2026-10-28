@@ -241,6 +241,14 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        # Garmin refresh tokens die 90 days after issue; push-only apps rarely use them otherwise.
+        # Hourly so a failed refresh is retried soon; a run with nothing due is one indexed query.
+        "refresh-garmin-tokens-hourly": {
+            "task": CeleryTask.GARMIN_REFRESH_TOKENS,
+            "schedule": crontab(minute=23),
+            "args": (),
+            "kwargs": {},
+        },
     }
 
     if settings.data_lifecycle_enabled:

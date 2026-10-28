@@ -41,6 +41,22 @@ from tests.factories import (
 class TestEventRecordServiceCreateDetail:
     """Test creating event record details."""
 
+    def test_created_event_fires_only_for_an_inserted_detail(self, db: Session) -> None:
+        event_record = EventRecordFactory(category="workout", type_="running")
+        detail_payload = EventRecordDetailCreate(record_id=event_record.id, heart_rate_avg=Decimal("150"))
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_workout_created") as created,
+        ):
+            first = event_record_service.create_detail(db, detail_payload)
+            again = event_record_service.create_detail(db, detail_payload)
+
+        assert first.record_id == again.record_id == event_record.id
+        # The second call found the stored detail: a duplicate, not a new workout.
+        assert created.call_count == 1
+        assert created.call_args.kwargs["record_id"] == event_record.id
+
     def test_create_detail_with_heart_rate_metrics(self, db: Session) -> None:
         """Should create event record detail with heart rate metrics."""
         # Arrange

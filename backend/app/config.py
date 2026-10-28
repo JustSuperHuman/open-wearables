@@ -197,6 +197,22 @@ class Settings(BaseSettings):
     # Shown to users in Garmin Connect as the workout's source when a pushed workout doesn't set
     # workoutProvider / workoutSourceId itself. Garmin caps both fields at 20 characters.
     garmin_workout_provider: str = Field("JustGains", min_length=1, max_length=20)
+    # Shared secret Garmin appends to the push URLs registered in its portal (?token=...). Garmin only
+    # identifies itself with the garmin-client-id header, and the client id is not a secret. With a token
+    # set and GARMIN_WEBHOOK_TOKEN_REQUIRED off, pushes without it are still accepted (with a warning), so
+    # the portal URLs can be updated before the token is enforced.
+    garmin_webhook_token: SecretStr | None = None
+    garmin_webhook_token_required: bool = False
+    # Garmin refresh tokens expire 90 days after they are issued and rotate on every refresh. A push-only
+    # app may not need a token for months, so a periodic job refreshes any token older than this.
+    garmin_refresh_token_max_age_days: int = Field(60, ge=1, le=85)
+    # Garmin writes (Training/Courses API) run inside an API request: each request gets this total time
+    # budget across all its Garmin calls (token refresh included), and no single call waits longer than
+    # garmin_write_call_timeout_seconds. At most garmin_write_concurrency of them run at once, on threads
+    # of their own, so a slow Garmin can't starve webhook receivers and other routes of worker threads.
+    garmin_write_timeout_seconds: float = Field(20.0, gt=0, le=120)
+    garmin_write_call_timeout_seconds: float = Field(10.0, gt=0, le=120)
+    garmin_write_concurrency: int = Field(8, ge=1, le=64)
 
     # POLAR OAUTH SETTINGS
     polar_client_id: str | None = None
@@ -386,6 +402,15 @@ class Settings(BaseSettings):
                 "SDK_PAYLOAD_S3_OFFLOAD is on but no S3 bucket is configured - "
                 "set RAW_PAYLOAD_S3_BUCKET or AWS_BUCKET_NAME."
             )
+        return self
+
+    @model_validator(mode="after")
+    def check_garmin_webhook_token(self) -> "Settings":
+        """Requiring a token that isn't set would reject every Garmin push; fail at startup instead."""
+        if self.garmin_webhook_token_required and (
+            self.garmin_webhook_token is None or not self.garmin_webhook_token.get_secret_value()
+        ):
+            raise ValueError("GARMIN_WEBHOOK_TOKEN_REQUIRED is on but GARMIN_WEBHOOK_TOKEN is not set.")
         return self
 
     @model_validator(mode="after")

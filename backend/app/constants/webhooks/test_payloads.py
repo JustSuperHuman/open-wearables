@@ -142,6 +142,25 @@ EXAMPLE_PAYLOADS: dict[str, dict] = {
             "elevation_gain_meters": 120.0,
         },
     },
+    WebhookEventType.WORKOUT_UPDATED: {
+        "type": WebhookEventType.WORKOUT_UPDATED,
+        "data": {
+            "id": _RECORD_ID,
+            "user_id": _USER_ID,
+            "type": "running",
+            "start_time": "2024-01-01T08:00:00+00:00",
+            "end_time": "2024-01-01T08:50:00+00:00",
+            "zone_offset": "+00:00",
+            "duration_seconds": 3000.0,
+            "source": _SOURCE_GARMIN,
+            "calories_kcal": 410.0,
+            "distance_meters": 8500.0,
+            "avg_heart_rate_bpm": 158,
+            "max_heart_rate_bpm": 178,
+            "avg_pace_sec_per_km": 353,
+            "elevation_gain_meters": 120.0,
+        },
+    },
     WebhookEventType.SLEEP_CREATED: {
         "type": WebhookEventType.SLEEP_CREATED,
         "data": {

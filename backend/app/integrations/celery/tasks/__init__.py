@@ -29,6 +29,7 @@ from .garmin.backfill_timeout import (
 from .garmin.backfill_trigger import (
     trigger_backfill_for_type as trigger_garmin_backfill_for_type,
 )
+from .garmin.token_task import refresh_garmin_tokens, resolve_garmin_user_id
 from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import complete_and_process_aws_upload, process_aws_upload
 from .process_sdk_upload_task import process_sdk_upload
@@ -52,6 +53,9 @@ __all__ = [
     "start_garmin_full_backfill",
     "trigger_garmin_backfill_for_type",
     "trigger_garmin_next_pending_type",
+    # Garmin token upkeep
+    "refresh_garmin_tokens",
+    "resolve_garmin_user_id",
     # Archival
     "run_daily_archival",
     # One-off data migrations

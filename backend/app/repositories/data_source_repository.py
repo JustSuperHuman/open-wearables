@@ -457,6 +457,20 @@ class DataSourceRepository(
             .all()
         )
 
+    def get_device_models(self, db_session: DbSession, user_id: UUID, provider: ProviderName) -> list[str]:
+        """Distinct device models the user's sources from ``provider`` are filed under."""
+        rows = db_session.execute(
+            select(self.model.device_model)
+            .where(
+                self.model.user_id == user_id,
+                self.model.provider == provider,
+                self.model.device_model.is_not(None),
+            )
+            .distinct()
+            .order_by(self.model.device_model)
+        )
+        return [model for (model,) in rows if model]
+
     def get_writer_siblings(self, db_session: DbSession, data_source_ids: set[UUID]) -> dict[UUID, tuple[UUID, ...]]:
         """Other sources of the same user, provider and writer (app id, else source) for each given source.
 

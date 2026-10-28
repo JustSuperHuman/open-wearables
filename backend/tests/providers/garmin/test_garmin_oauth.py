@@ -7,6 +7,7 @@ import httpx
 import pytest
 from sqlalchemy.orm import Session
 
+from app.constants.celery_tasks import CeleryTask
 from app.models import User
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
@@ -129,12 +130,74 @@ class TestGarminOAuth:
         mock_httpx_get.side_effect = httpx.HTTPError("API Error")
 
         # Act
-        user_info = garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
+        with patch("app.services.providers.garmin.oauth.time.sleep") as sleep:
+            user_info = garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
 
-        # Assert - should return None values on error
+        # Assert - should return None values on error, after retrying the lookup
         assert user_info["user_id"] is None
         assert user_info["username"] is None
         assert user_info["scope"] is None
+        assert mock_httpx_get.call_count == 3
+        assert sleep.call_count == 2
+
+    @patch("httpx.get")
+    def test_get_provider_user_info_retries_a_failed_user_id_lookup(
+        self,
+        mock_httpx_get: MagicMock,
+        garmin_oauth: GarminOAuth,
+    ) -> None:
+        token_response = OAuthTokenResponse(access_token="t", token_type="Bearer", expires_in=86400)
+        user_id_response = MagicMock()
+        user_id_response.json.return_value = {"userId": "garmin_user_123"}
+        permissions_response = MagicMock()
+        permissions_response.json.return_value = {"permissions": ["WORKOUT_IMPORT"]}
+        mock_httpx_get.side_effect = [httpx.ConnectError("blip"), user_id_response, permissions_response]
+
+        with patch("app.services.providers.garmin.oauth.time.sleep"):
+            user_info = garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
+
+        assert user_info["user_id"] == "garmin_user_123"
+        assert user_info["scope"] == "WORKOUT_IMPORT"
+
+    def test_connection_saved_without_user_id_queues_the_lookup(self, db: Session, garmin_oauth: GarminOAuth) -> None:
+        user = UserFactory()
+        token_response = OAuthTokenResponse(access_token="t", token_type="Bearer", expires_in=86400, refresh_token="r")
+        state = MagicMock(user_id=user.id)
+
+        with patch("app.services.providers.garmin.oauth.celery_app") as celery:
+            garmin_oauth._save_connection(
+                db, user.id, token_response, {"user_id": None, "username": None, "scope": None}, state
+            )
+
+        celery.send_task.assert_called_once()
+        assert celery.send_task.call_args.args == (CeleryTask.GARMIN_RESOLVE_USER_ID,)
+        assert celery.send_task.call_args.kwargs["args"] == [str(user.id)]
+
+    def test_connection_saved_with_user_id_queues_nothing(self, db: Session, garmin_oauth: GarminOAuth) -> None:
+        user = UserFactory()
+        token_response = OAuthTokenResponse(access_token="t", token_type="Bearer", expires_in=86400, refresh_token="r")
+
+        with patch("app.services.providers.garmin.oauth.celery_app") as celery:
+            garmin_oauth._save_connection(
+                db, user.id, token_response, {"user_id": "g-1", "username": None, "scope": None}, MagicMock()
+            )
+
+        celery.send_task.assert_not_called()
+
+    def test_reconnecting_another_garmin_account_updates_the_user_id(
+        self, db: Session, garmin_oauth: GarminOAuth
+    ) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="garmin", provider_user_id="old-garmin-account")
+        token_response = OAuthTokenResponse(access_token="t", token_type="Bearer", expires_in=86400, refresh_token="r")
+
+        with patch("app.services.providers.garmin.oauth.celery_app"):
+            garmin_oauth._save_connection(
+                db, user.id, token_response, {"user_id": "new-garmin-account", "username": None}, MagicMock()
+            )
+
+        db.refresh(connection)
+        assert connection.provider_user_id == "new-garmin-account"
 
     @patch("httpx.get")
     def test_get_provider_user_info_returns_scope(

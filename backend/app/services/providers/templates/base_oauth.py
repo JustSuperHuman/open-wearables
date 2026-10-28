@@ -68,6 +68,13 @@ class BaseOAuthTemplate(ABC):
     use_pkce: bool = False
     auth_method: AuthenticationMethod = AuthenticationMethod.BASIC_AUTH
 
+    #: Status a connection gets once the provider stops accepting our tokens (refresh token
+    #: rejected, or the API refusing a freshly refreshed access token). REVOKED stops all data for
+    #: the connection. A provider whose webhooks deliver data without our token (Garmin) uses
+    #: EXPIRED instead: its pushes keep being stored until the user deregisters, and only calls
+    #: made with the token need the user to reconnect.
+    token_rejected_status: ConnectionStatus = ConnectionStatus.REVOKED
+
     def get_authorization_url(self, user_id: UUID, redirect_uri: str | None = None) -> tuple[str, str]:
         """Generates the provider's authorization URL.
 
@@ -135,7 +142,13 @@ class BaseOAuthTemplate(ABC):
         return oauth_state
 
     def refresh_access_token(
-        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_failure: bool = True
+        self,
+        db: DbSession,
+        user_id: UUID,
+        refresh_token: str,
+        *,
+        revoke_on_failure: bool = True,
+        timeout: float = 30.0,
     ) -> OAuthTokenResponse:
         """Refreshes the access token using the refresh token.
 
@@ -149,7 +162,7 @@ class BaseOAuthTemplate(ABC):
                 self.endpoints.token_url,
                 data=data,
                 headers=headers,
-                timeout=30.0,
+                timeout=timeout,
             )
             response.raise_for_status()
             token_response = OAuthTokenResponse.model_validate(response.json())
@@ -188,7 +201,7 @@ class BaseOAuthTemplate(ABC):
             # 400/401 = refresh token is dead so revoke + notify
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
                 if revoke_on_failure:
-                    self._revoke_connection(db, user_id, reason="refresh_failed")
+                    self.mark_tokens_rejected(db, user_id, reason="refresh_failed")
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",
@@ -205,18 +218,34 @@ class BaseOAuthTemplate(ABC):
             )
             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token refresh failed: {str(e)}")
 
-    def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
-        """Mark the connection revoked and emit a connection.revoked webhook."""
+    def mark_tokens_rejected(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
+        """The provider no longer accepts this connection's tokens; the user has to reconnect.
+
+        The connection gets ``token_rejected_status`` and a connection.revoked webhook carries
+        ``reason`` (e.g. ``refresh_failed``).
+        """
+        self._revoke_connection(db, user_id, reason=reason, status=self.token_rejected_status)
+
+    def _revoke_connection(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        *,
+        reason: str,
+        status: ConnectionStatus = ConnectionStatus.REVOKED,
+    ) -> None:
+        """Mark the connection revoked (or ``status``) and emit a connection.revoked webhook."""
         connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
-        if not connection or connection.status == ConnectionStatus.REVOKED:
+        if not connection or connection.status in (ConnectionStatus.REVOKED, status):
             return
-        self.connection_repo.mark_as_revoked(db, connection)
+        self.connection_repo.set_status(db, connection, status)
         log_structured(
             logger,
             "info",
             "Connection revoked",
             action="connection_revoked",
             reason=reason,
+            status=status.value,
             provider=self.provider_name,
             user_id=str(user_id),
             connection_id=str(connection.id),

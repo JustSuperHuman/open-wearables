@@ -3,7 +3,9 @@
 Each value follows the Svix convention: ``<resource>.<action>``.
 Keep in sync with the init script that registers them with the Svix server.
 
-All events use the ``created`` action — there is no update/patch flow.
+Events use the ``created`` action, except ``workout.updated``: a provider can revise a workout
+after it was stored (an activity edited in Garmin Connect), and that event carries the workout as
+it is now under the id ``workout.created`` announced.
 
 **Two-level hierarchy:**
 - *Group events* (e.g. ``heart_rate.created``) fire for any sample belonging to
@@ -46,6 +48,7 @@ class WebhookEventType(StrEnum):
     # EventRecord-based (discrete sessions)
     # -------------------------------------------------------------------------
     WORKOUT_CREATED = "workout.created"
+    WORKOUT_UPDATED = "workout.updated"
     SLEEP_CREATED = "sleep.created"
     MEAL_CREATED = "meal.created"
     MENSTRUAL_CYCLE_CREATED = "menstrual_cycle.created"
@@ -220,6 +223,10 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
         "One data type failed or was lost within a sync run, while others may have succeeded."
     ),
     WebhookEventType.WORKOUT_CREATED: "A new workout session was saved.",
+    WebhookEventType.WORKOUT_UPDATED: (
+        "A saved workout changed, e.g. the user edited the activity at the provider. Same payload as "
+        "workout.created, with the workout's current values under the same id."
+    ),
     WebhookEventType.SLEEP_CREATED: "A new (or merged) sleep session was saved.",
     WebhookEventType.MEAL_CREATED: "A new meal or nutrition-log entry was saved.",
     WebhookEventType.MENSTRUAL_CYCLE_CREATED: "A new menstrual cycle record was saved.",

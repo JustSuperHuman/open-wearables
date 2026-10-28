@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from logging import Logger, getLogger
@@ -73,6 +74,7 @@ from app.services.outgoing_webhooks.events import (
     on_menstrual_cycle_created,
     on_sleep_created,
     on_workout_created,
+    on_workout_updated,
 )
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
@@ -112,6 +114,28 @@ def pace_sec_per_km(distance_meters: float | None, seconds: int | None) -> float
     if distance_meters is None or seconds is None or distance_meters <= 0 or seconds <= 0:
         return None
     return round(seconds / (distance_meters / 1000), 1)
+
+
+# What a workout revision can change: the record's type and span, and the workout_details columns.
+_WORKOUT_RECORD_FIELDS = ("type", "duration_seconds", "start_datetime", "end_datetime", "zone_offset")
+_WORKOUT_DETAIL_COLUMNS = frozenset(WorkoutDetails.__table__.columns.keys()) - {"record_id"}
+
+
+@dataclass(frozen=True)
+class WorkoutRevision:
+    """Outcome of applying a provider's revised workout to the records stored under its external id."""
+
+    # Records whose stored values changed.
+    updated: list[UUID] = field(default_factory=list)
+    # Records that already held exactly this version.
+    unchanged: list[UUID] = field(default_factory=list)
+    # Records left as they were: the revised span collides with another workout of the same source.
+    conflicts: list[UUID] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        """Whether anything was stored under the external id at all."""
+        return bool(self.updated or self.unchanged or self.conflicts)
 
 
 class EventRecordService(
@@ -188,7 +212,11 @@ class EventRecordService(
         detail: EventRecordDetailCreate,
         detail_type: DetailType = EventCategory.WORKOUT,
     ) -> EventRecordDetail:
-        result = self.event_record_detail_repo.create(db_session, detail, detail_type=detail_type)
+        result, inserted = self.event_record_detail_repo.create_or_get(db_session, detail, detail_type=detail_type)
+        # A detail that was already stored belongs to a record whose *.created event went out
+        # when it was inserted; announcing it again would report a duplicate as new data.
+        if not inserted:
+            return result
         # event_record_detail_repo.create commits internally, so data is already persisted.
         # Fire the webhook directly with fresh fetches rather than via after_commit — using
         # after_commit defers the call to the *next* session commit, at which point SQLAlchemy
@@ -220,6 +248,13 @@ class EventRecordService(
         self.event_record_detail_repo.update_workout_fields(db_session, record_id, fields)
         db_session.commit()
 
+    def get_workout_ids_by_external_id(
+        self, db_session: DbSession, user_id: UUID, provider: str, external_id: str
+    ) -> list[UUID]:
+        """Ids of the user's workouts ``provider`` stored under ``external_id`` (one per data source)."""
+        stored = self.crud.get_all_by_external_id(db_session, user_id, external_id, provider, EventCategory.WORKOUT)
+        return [record.id for record in stored]
+
     def apply_workout_revision(
         self,
         db_session: DbSession,
@@ -227,26 +262,31 @@ class EventRecordService(
         provider: str,
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
-    ) -> list[UUID]:
+    ) -> WorkoutRevision:
         """Overwrite the stored workouts that carry ``record.external_id`` with a provider's revised version.
 
-        For activities edited at the provider after we stored them. create() can't apply an edit: it is
-        insert-or-return-existing on (data source, start, end), so a new start or duration inserts a
-        second workout and an unchanged span keeps the stale values. Only non-null detail values are
-        written, so fields the revision doesn't carry (FIT segments, zones, route) are kept.
+        For activities edited at the provider after we stored them, and for a provider re-sending an
+        activity we already hold. create() can't apply either: it is insert-or-return-existing on
+        (data source, start, end), so a new start or duration inserts a second workout and an
+        unchanged span keeps the stale values. Only non-null detail values are written, so fields the
+        revision doesn't carry (FIT segments, zones, route) are kept.
 
-        Returns the ids of the records updated; empty when nothing is stored under that external_id.
+        A revision whose new span collides with another workout of the same data source is not
+        applied; the record is reported in ``conflicts`` and left as it was. A workout.updated
+        webhook goes out for every record whose stored values changed.
         """
         if not record.external_id:
-            return []
+            return WorkoutRevision()
         stored = self.crud.get_all_by_external_id(
             db_session, user_id, record.external_id, provider, EventCategory.WORKOUT
         )
-        workout_columns = set(WorkoutDetails.__table__.columns.keys()) - {"record_id"}
-        fields = {k: v for k, v in detail.model_dump(exclude_none=True).items() if k in workout_columns}
+        fields = {k: v for k, v in detail.model_dump(exclude_none=True).items() if k in _WORKOUT_DETAIL_COLUMNS}
 
         updated: list[UUID] = []
+        unchanged: list[UUID] = []
+        conflicts: list[UUID] = []
         for existing in stored:
+            before = self._workout_snapshot(db_session, existing)
             if not self.crud.apply_revision(db_session, existing, record):
                 log_structured(
                     self.logger,
@@ -257,6 +297,7 @@ class EventRecordService(
                     user_id=str(user_id),
                     record_id=str(existing.id),
                 )
+                conflicts.append(existing.id)
                 continue
             if self.event_record_detail_repo.get_by_record_id(db_session, existing.id, EventCategory.WORKOUT) is None:
                 self.event_record_detail_repo.create_and_flush(
@@ -264,9 +305,38 @@ class EventRecordService(
                 )
             elif fields:
                 self.event_record_detail_repo.update_workout_fields(db_session, existing.id, fields)
-            updated.append(existing.id)
+            db_session.flush()
+            # Compared as stored (column precision applied), so a re-sent activity is no change.
+            changed = self._workout_snapshot(db_session, existing) != before
+            (updated if changed else unchanged).append(existing.id)
         db_session.commit()
-        return updated
+
+        for record_id in updated:
+            self._emit_workout_updated(db_session, record_id)
+        return WorkoutRevision(updated=updated, unchanged=unchanged, conflicts=conflicts)
+
+    def _workout_snapshot(self, db_session: DbSession, record: EventRecord) -> dict[str, Any]:
+        """A workout's stored values (record span and type plus its detail row), read back from the database."""
+        db_session.refresh(record)
+        values: dict[str, Any] = {name: getattr(record, name) for name in _WORKOUT_RECORD_FIELDS}
+        detail = self.event_record_detail_repo.get_by_record_id(db_session, record.id, EventCategory.WORKOUT)
+        if detail is not None:
+            db_session.refresh(detail)
+            values.update({column: getattr(detail, column) for column in _WORKOUT_DETAIL_COLUMNS})
+        return values
+
+    def _emit_workout_updated(self, db_session: DbSession, record_id: UUID) -> None:
+        """Fire workout.updated for a stored workout, from its values as now committed."""
+        if not svix_service.is_enabled():
+            return
+        record = self.crud.get(db_session, record_id)
+        if record is None or record.data_source_id is None:
+            return
+        data_source = self.data_source_repo.get(db_session, record.data_source_id)
+        detail = self.event_record_detail_repo.get_by_record_id(db_session, record_id, EventCategory.WORKOUT)
+        if data_source is None:
+            return
+        on_workout_updated(**self._workout_event_fields(record, data_source, detail), sync=current_sync_payload())
 
     @staticmethod
     def _to_local(dt: datetime, zone_offset: str | None) -> datetime:
@@ -681,6 +751,40 @@ class EventRecordService(
         return created_record, True, new_detail
 
     @staticmethod
+    def _workout_event_fields(record: EventRecord, data_source: DataSource, detail: Any) -> dict[str, Any]:
+        """The workout.created / workout.updated payload fields.
+
+        ``detail`` is the detail being created, the stored workout_details row, or None; both
+        carry the same field names.
+        """
+
+        def value(name: str) -> Any:
+            return getattr(detail, name, None) if detail is not None else None
+
+        energy, distance, elevation = value("energy_burned"), value("distance"), value("total_elevation_gain")
+        hr_avg, hr_max, moving_time = value("heart_rate_avg"), value("heart_rate_max"), value("moving_time_seconds")
+        avg_pace = pace_sec_per_km(
+            as_float(distance), moving_time if moving_time is not None else record.duration_seconds
+        )
+        return {
+            "record_id": record.id,
+            "user_id": data_source.user_id,
+            "provider": str(data_source.provider),
+            "device": data_source.device_model,
+            "workout_type": record.type,
+            "start_time": record.start_datetime.isoformat(),
+            "end_time": record.end_datetime.isoformat(),
+            "zone_offset": record.zone_offset,
+            "duration_seconds": record.duration_seconds,
+            "calories_kcal": float(energy) if energy is not None else None,
+            "distance_meters": float(distance) if distance is not None else None,
+            "avg_heart_rate_bpm": int(hr_avg) if hr_avg is not None else None,
+            "max_heart_rate_bpm": int(hr_max) if hr_max is not None else None,
+            "elevation_gain_meters": float(elevation) if elevation is not None else None,
+            "avg_pace_sec_per_km": round(avg_pace) if avg_pace is not None else None,
+        }
+
+    @staticmethod
     def _emit_event_record_webhook(
         record: EventRecord,
         data_source: DataSource,
@@ -756,30 +860,7 @@ class EventRecordService(
                     sync=sync,
                 )
             case EventCategory.WORKOUT:
-                avg_pace = pace_sec_per_km(
-                    as_float(detail.distance),
-                    detail.moving_time_seconds if detail.moving_time_seconds is not None else record.duration_seconds,
-                )
-                on_workout_created(
-                    record_id=record.id,
-                    user_id=data_source.user_id,
-                    provider=provider,
-                    device=device,
-                    workout_type=record.type,
-                    start_time=record.start_datetime.isoformat(),
-                    end_time=record.end_datetime.isoformat(),
-                    zone_offset=zone_offset,
-                    duration_seconds=record.duration_seconds,
-                    calories_kcal=float(detail.energy_burned) if detail.energy_burned is not None else None,
-                    distance_meters=float(detail.distance) if detail.distance is not None else None,
-                    avg_heart_rate_bpm=int(detail.heart_rate_avg) if detail.heart_rate_avg is not None else None,
-                    max_heart_rate_bpm=int(detail.heart_rate_max) if detail.heart_rate_max is not None else None,
-                    elevation_gain_meters=float(detail.total_elevation_gain)
-                    if detail.total_elevation_gain is not None
-                    else None,
-                    avg_pace_sec_per_km=round(avg_pace) if avg_pace is not None else None,
-                    sync=sync,
-                )
+                on_workout_created(**EventRecordService._workout_event_fields(record, data_source, detail), sync=sync)
             case EventCategory.MEAL if isinstance(detail, MealDetailCreate):
                 calories_kcal, macros, water_ml = _meal_summary(detail.nutrients)
                 on_meal_created(

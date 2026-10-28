@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
@@ -12,7 +13,9 @@ from fastapi import HTTPException, status
 from app.config import settings
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.models import UserConnection
 from app.repositories import UserConnectionRepository
+from app.schemas.auth import ConnectionStatus
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
 
@@ -21,6 +24,87 @@ logger = logging.getLogger(__name__)
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+
+# Refresh an access token this long before it expires. Garmin asks for at least 600 s so a slow network
+# can't leave a request holding a token that expires in flight; the margin costs other providers nothing.
+TOKEN_REFRESH_BUFFER = timedelta(minutes=10)
+
+# Longest wait for another worker's refresh of the same connection before giving up.
+_REFRESH_LOCK_WAIT_SECONDS = 10.0
+
+
+def _expires_soon(connection: UserConnection) -> bool:
+    return connection.token_expires_at is not None and connection.token_expires_at < (
+        datetime.now(timezone.utc) + TOKEN_REFRESH_BUFFER
+    )
+
+
+def _usable_connection(
+    db: DbSession, user_id: UUID, provider_name: str, connection_repo: UserConnectionRepository
+) -> UserConnection:
+    connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"User not connected to {provider_name}",
+        )
+    # SDK-based providers don't have access tokens
+    if not connection.access_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"No access token available for {provider_name} (SDK-based provider?)",
+        )
+    # The provider already rejected these tokens (see BaseOAuthTemplate.token_rejected_status);
+    # asking its token endpoint again would only fail again.
+    if connection.status == ConnectionStatus.EXPIRED:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"{provider_name} authorization expired; reconnection required",
+        )
+    return connection
+
+
+def refresh_tokens_if(
+    db: DbSession,
+    user_id: UUID,
+    provider_name: str,
+    connection_repo: UserConnectionRepository,
+    oauth: BaseOAuthTemplate,
+    needs_refresh: Callable[[UserConnection], bool],
+    *,
+    revoke_on_failure: bool = True,
+    timeout: float | None = None,
+) -> str:
+    """Refresh the connection's tokens if ``needs_refresh`` still holds once the per-user lock is held.
+
+    The lock serialises refreshes of one connection across workers, and the check is repeated on a
+    freshly read row inside it, so a refresh another worker just finished is reused rather than
+    repeated (providers that rotate refresh tokens would reject the second one). Returns the access
+    token to use.
+
+    ``timeout`` caps both the wait for the lock and the call to the token endpoint.
+    """
+    redis_client = get_redis_client()
+    lock_key = f"token_refresh_lock:{provider_name}:{user_id}"
+    lock_wait = _REFRESH_LOCK_WAIT_SECONDS if timeout is None else min(timeout, _REFRESH_LOCK_WAIT_SECONDS)
+
+    with redis_client.lock(lock_key, timeout=60, blocking_timeout=lock_wait, sleep=0.2):
+        connection = _usable_connection(db, user_id, provider_name, connection_repo)
+        db.refresh(connection)
+        if not needs_refresh(connection):
+            return connection.access_token  # ty:ignore[invalid-return-type]
+
+        if not connection.refresh_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Token expired and no refresh token available for {provider_name}",
+            )
+
+        refresh_options: dict[str, Any] = {"revoke_on_failure": revoke_on_failure}
+        if timeout is not None:
+            refresh_options["timeout"] = timeout
+        token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token, **refresh_options)
+        return token_response.access_token
 
 
 def get_valid_token(
@@ -31,73 +115,44 @@ def get_valid_token(
     oauth: BaseOAuthTemplate,
     *,
     revoke_on_failure: bool = True,
+    rejected_token: str | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Get a valid access token, refreshing if necessary.
 
     Used by make_authenticated_request and by calls that send the token outside
     of it, e.g. provider deregistration.
+
+    ``rejected_token`` is an access token the provider just answered 401 for: the token is
+    refreshed even though our clock says it is still valid, unless another worker has already
+    replaced it. ``timeout`` caps the lock wait and the token endpoint call.
     """
-    connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
-    if not connection:
+    connection = _usable_connection(db, user_id, provider_name, connection_repo)
+
+    def needs_refresh(current: UserConnection) -> bool:
+        if rejected_token is not None and current.access_token == rejected_token:
+            return True
+        return _expires_soon(current)
+
+    if not needs_refresh(connection):
+        return connection.access_token  # ty:ignore[invalid-return-type]
+
+    if not connection.refresh_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"User not connected to {provider_name}",
+            detail=f"Token expired and no refresh token available for {provider_name}",
         )
 
-    # SDK-based providers don't have access tokens
-    if not connection.access_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"No access token available for {provider_name} (SDK-based provider?)",
-        )
-
-    # Check if token is expired (with 5 minute buffer)
-    if connection.token_expires_at and connection.token_expires_at < datetime.now(timezone.utc) + timedelta(minutes=5):
-        if not connection.refresh_token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Token expired and no refresh token available for {provider_name}",
-            )
-        # Scope distributed lock per user/provider to avoid concurrent refresh race conditions.
-
-        redis_client = get_redis_client()
-        lock_key = f"token_refresh_lock:{provider_name}:{user_id}"
-
-        with redis_client.lock(lock_key, timeout=60, blocking_timeout=10, sleep=0.2):
-            # Fetch and refresh connection instance inside the lock
-            connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
-            if not connection:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=f"User not connected to {provider_name}",
-                )
-            if not connection.access_token:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=f"No access token available for {provider_name} (SDK-based provider?)",
-                )
-
-            db.refresh(connection)
-
-            # 1. If the token never expires, return it directly
-            # 2. If it expires in the future (> 5 min buffer), return existing token
-            now = datetime.now(timezone.utc)
-            if not connection.token_expires_at or connection.token_expires_at >= now + timedelta(minutes=5):
-                return connection.access_token
-
-            # Guard against missing refresh token before attempting OAuth refresh
-            if not connection.refresh_token:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=f"Token expired and no refresh token available for {provider_name}",
-                )
-
-            token_response = oauth.refresh_access_token(
-                db, user_id, connection.refresh_token, revoke_on_failure=revoke_on_failure
-            )
-            return token_response.access_token
-
-    return connection.access_token
+    return refresh_tokens_if(
+        db,
+        user_id,
+        provider_name,
+        connection_repo,
+        oauth,
+        needs_refresh,
+        revoke_on_failure=revoke_on_failure,
+        timeout=timeout,
+    )
 
 
 def make_authenticated_request(

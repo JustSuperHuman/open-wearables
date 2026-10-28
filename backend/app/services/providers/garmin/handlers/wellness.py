@@ -60,7 +60,7 @@ def process_wellness_items(
             errors.append(f"{summary_type}: missing userId")
             continue
 
-        connections = connection_repo.get_all_by_provider_user_id(db, "garmin", garmin_user_id)
+        connections = connection_repo.get_all_by_provider_user_id(db, "garmin", garmin_user_id, include_expired=True)
         if not connections:
             log_structured(
                 logger,

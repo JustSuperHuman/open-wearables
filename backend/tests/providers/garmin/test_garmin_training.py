@@ -25,6 +25,7 @@ from app.services.providers.garmin.write_client import (
     GarminErrorCode,
     GarminWriteClient,
     stored_permissions,
+    time_budget,
 )
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -99,6 +100,14 @@ class TestWorkoutValidation:
         with pytest.raises(GarminApiError, match="at most 25 segments"):
             validate_workout(_workout("MULTI_SPORT", segments=[[_step(1)]] * 26))
 
+    def test_single_sport_rejects_a_second_segment(self) -> None:
+        with pytest.raises(GarminApiError, match="one segment") as exc:
+            validate_workout(_workout("RUNNING", segments=[[_step(1)], [_step(2)]]))
+        assert "MULTI_SPORT" in exc.value.detail
+
+    def test_single_sport_without_segments_is_left_to_garmin(self) -> None:
+        validate_workout({"workoutName": "Bare", "sport": "RUNNING"})
+
     def test_rejects_segments_that_are_not_a_list(self) -> None:
         workout = _workout()
         workout["segments"] = {"steps": []}
@@ -165,11 +174,30 @@ class TestCourseValidation:
             validate_course(course)
         assert exc.value.code == GarminErrorCode.VALIDATION_ERROR
 
+    @pytest.mark.parametrize("field", ["distance", "elevationGain", "elevationLoss"])
+    def test_rejects_booleans_as_numbers(self, course: dict[str, Any], field: str) -> None:
+        # bool is an int subclass in Python, and True would reach Garmin as a distance of 1.
+        course[field] = True
+        with pytest.raises(GarminApiError, match=field):
+            validate_course(course)
+
+    def test_accepts_10000_geo_points(self, course: dict[str, Any]) -> None:
+        course["geoPoints"] = [{"latitude": 1.0, "longitude": 2.0}] * 10_000
+        validate_course(course)
+
+    def test_rejects_more_than_10000_geo_points(self, course: dict[str, Any]) -> None:
+        course["geoPoints"] = [{"latitude": 1.0, "longitude": 2.0}] * 10_001
+        with pytest.raises(GarminApiError, match="10,000 geoPoints"):
+            validate_course(course)
+
 
 class TestStoredPermissions:
     def test_none_when_scope_missing(self) -> None:
         assert stored_permissions(None) is None
-        assert stored_permissions("") is None
+
+    def test_empty_scope_is_nothing_granted(self) -> None:
+        # Stored by a permissions change or live read in which the user granted nothing.
+        assert stored_permissions("") == []
 
     def test_oauth_scopes_alone_are_unknown(self) -> None:
         assert stored_permissions("PARTNER_WRITE PARTNER_READ CONNECT_READ CONNECT_WRITE") is None
@@ -216,12 +244,12 @@ class TestGarminWriteClient:
     @pytest.mark.parametrize(
         ("status_code", "code", "http_status"),
         [
-            (401, GarminErrorCode.NOT_CONNECTED, 404),
             (412, GarminErrorCode.PERMISSION_MISSING, 403),
             (429, GarminErrorCode.RATE_LIMITED, 429),
             (400, GarminErrorCode.VALIDATION_ERROR, 422),
-            (403, GarminErrorCode.VALIDATION_ERROR, 422),
-            (404, GarminErrorCode.VALIDATION_ERROR, 422),
+            (403, GarminErrorCode.FORBIDDEN, 403),
+            (404, GarminErrorCode.NOT_FOUND, 404),
+            (409, GarminErrorCode.VALIDATION_ERROR, 422),
             (500, GarminErrorCode.UPSTREAM_ERROR, 502),
             (503, GarminErrorCode.UPSTREAM_ERROR, 502),
         ],
@@ -295,6 +323,98 @@ class TestGarminWriteClient:
             client.request(db, user.id, "POST", "/workoutportal/workout/v2", json_body={})
 
         assert exc.value.code == GarminErrorCode.NOT_CONNECTED
+        request.assert_not_called()
+
+    def test_401_refreshes_once_and_retries(self, client: GarminWriteClient, db: Session) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="garmin", access_token="stale-by-garmin")
+        refreshed = MagicMock(access_token="fresh-token")
+
+        def refresh(*_args: Any, **_kwargs: Any) -> MagicMock:
+            connection.access_token = "fresh-token"
+            db.commit()
+            return refreshed
+
+        with (
+            patch.object(GarminOAuth, "refresh_access_token", side_effect=refresh) as refresh_call,
+            patch(HTTPX_REQUEST, side_effect=[_response(401), _response(200, {"workoutId": 7})]) as request,
+        ):
+            result = client.request(db, user.id, "POST", "/workoutportal/workout/v2", json_body={})
+
+        assert result.body == {"workoutId": 7}
+        refresh_call.assert_called_once()
+        tokens = [call.kwargs["headers"]["Authorization"] for call in request.call_args_list]
+        assert tokens == ["Bearer stale-by-garmin", "Bearer fresh-token"]
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.ACTIVE
+
+    def test_second_401_marks_the_connection_for_reconnect(self, client: GarminWriteClient, db: Session) -> None:
+        user = UserFactory()
+        connection = UserConnectionFactory(user=user, provider="garmin", access_token="old")
+
+        def refresh(*_args: Any, **_kwargs: Any) -> MagicMock:
+            connection.access_token = "new"
+            db.commit()
+            return MagicMock(access_token="new")
+
+        with (
+            patch.object(GarminOAuth, "refresh_access_token", side_effect=refresh),
+            patch(HTTPX_REQUEST, return_value=_response(401)) as request,
+            patch("app.services.providers.templates.base_oauth.on_connection_revoked") as revoked,
+            pytest.raises(GarminApiError) as exc,
+        ):
+            client.request(db, user.id, "POST", "/workoutportal/workout/v2", json_body={})
+
+        assert exc.value.code == GarminErrorCode.NOT_CONNECTED
+        assert request.call_count == 2
+        db.refresh(connection)
+        # Expired, not revoked: Garmin keeps pushing until the user deregisters.
+        assert connection.status == ConnectionStatus.EXPIRED
+        assert revoked.call_args.kwargs["reason"] == "unauthorized"
+
+    def test_expired_connection_never_reaches_the_token_endpoint(self, client: GarminWriteClient, db: Session) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.EXPIRED, token_expires_at=EXPIRED)
+
+        with (
+            patch.object(GarminOAuth, "refresh_access_token") as refresh,
+            patch(HTTPX_REQUEST) as request,
+            pytest.raises(GarminApiError) as exc,
+        ):
+            client.request(db, user.id, "GET", "/partner-gateway/rest/user/permissions")
+
+        assert exc.value.code == GarminErrorCode.NOT_CONNECTED
+        refresh.assert_not_called()
+        request.assert_not_called()
+
+    def test_calls_use_the_per_call_timeout(self, client: GarminWriteClient, db: Session, user_id: Any) -> None:
+        with (
+            patch.object(settings, "garmin_write_call_timeout_seconds", 7.0),
+            patch(HTTPX_REQUEST, return_value=_response(204)) as request,
+        ):
+            client.request(db, user_id, "DELETE", "/training-api/workout/v2/1")
+        assert request.call_args.kwargs["timeout"] == 7.0
+
+    def test_time_budget_caps_the_call_timeout(self, client: GarminWriteClient, db: Session, user_id: Any) -> None:
+        with (
+            patch.object(settings, "garmin_write_call_timeout_seconds", 10.0),
+            patch(HTTPX_REQUEST, return_value=_response(204)) as request,
+            time_budget(3.0),
+        ):
+            client.request(db, user_id, "DELETE", "/training-api/workout/v2/1")
+        assert request.call_args.kwargs["timeout"] <= 3.0
+
+    def test_exhausted_time_budget_stops_before_calling_garmin(
+        self, client: GarminWriteClient, db: Session, user_id: Any
+    ) -> None:
+        with (
+            patch(HTTPX_REQUEST) as request,
+            time_budget(0.0),
+            pytest.raises(GarminApiError) as exc,
+        ):
+            client.request(db, user_id, "POST", "/workoutportal/workout/v2", json_body={})
+        assert exc.value.code == GarminErrorCode.UPSTREAM_ERROR
+        assert "time budget" in exc.value.detail
         request.assert_not_called()
 
     def test_token_endpoint_failure_is_upstream_error(self, client: GarminWriteClient, db: Session) -> None:

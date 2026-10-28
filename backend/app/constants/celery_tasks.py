@@ -19,6 +19,8 @@ class CeleryTask(StrEnum):
     GARMIN_TRIGGER_NEXT_PENDING_TYPE = f"{_PREFIX}.garmin.backfill_task.trigger_next_pending_type"
     GARMIN_CHECK_TRIGGERED_TIMEOUT = f"{_PREFIX}.garmin.backfill_timeout.check_triggered_timeout"
     GARMIN_TRIGGER_BACKFILL_FOR_TYPE = f"{_PREFIX}.garmin.backfill_trigger.trigger_backfill_for_type"
+    GARMIN_REFRESH_TOKENS = f"{_PREFIX}.garmin.token_task.refresh_garmin_tokens"
+    GARMIN_RESOLVE_USER_ID = f"{_PREFIX}.garmin.token_task.resolve_garmin_user_id"
     SYNC_ALL_USERS = f"{_PREFIX}.periodic_sync_task.sync_all_users"
     PROCESS_AWS_UPLOAD = f"{_PREFIX}.process_aws_upload_task.process_aws_upload"
     COMPLETE_AND_PROCESS_AWS_UPLOAD = f"{_PREFIX}.process_aws_upload_task.complete_and_process_aws_upload"

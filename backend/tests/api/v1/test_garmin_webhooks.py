@@ -10,9 +10,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr, ValidationError
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.config import Settings, settings
 from app.constants.celery_tasks import CeleryTask
 
 PUSH_ENDPOINT = "/api/v1/providers/garmin/webhooks"
@@ -177,3 +178,124 @@ class TestGarminDeprecatedRoutes:
 
         assert response.status_code == 200
         assert response.json() == {"status": "accepted"}
+
+
+ALL_GARMIN_ENDPOINTS = [PUSH_ENDPOINT, LEGACY_PUSH_ENDPOINT, LEGACY_PING_ENDPOINT]
+URL_TOKEN = "s3cr3t-garmin-push-token"
+
+
+class TestGarminWebhookUrlToken:
+    """GARMIN_WEBHOOK_TOKEN: a shared secret on the push URLs registered in Garmin's portal."""
+
+    @pytest.fixture
+    def token_configured(self) -> Generator[None, None, None]:
+        with patch.object(settings, "garmin_webhook_token", SecretStr(URL_TOKEN)):
+            yield
+
+    @pytest.fixture
+    def token_required(self, token_configured: None) -> Generator[None, None, None]:
+        with patch.object(settings, "garmin_webhook_token_required", True):
+            yield
+
+    @pytest.mark.parametrize("endpoint", ALL_GARMIN_ENDPOINTS)
+    def test_required_token_rejects_requests_without_it(
+        self, client: TestClient, db: Session, token_required: None, endpoint: str
+    ) -> None:
+        response = client.post(endpoint, headers={"garmin-client-id": VALID_CLIENT_ID}, json={"activities": []})
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize("endpoint", ALL_GARMIN_ENDPOINTS)
+    def test_required_token_rejects_a_wrong_one(
+        self, client: TestClient, db: Session, token_required: None, endpoint: str
+    ) -> None:
+        response = client.post(
+            f"{endpoint}?token=guessed", headers={"garmin-client-id": VALID_CLIENT_ID}, json={"activities": []}
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize("endpoint", ALL_GARMIN_ENDPOINTS)
+    def test_required_token_accepts_the_right_one(
+        self,
+        client: TestClient,
+        db: Session,
+        token_required: None,
+        mock_external_apis: dict[str, MagicMock],
+        endpoint: str,
+    ) -> None:
+        response = client.post(
+            f"{endpoint}?token={URL_TOKEN}", headers={"garmin-client-id": VALID_CLIENT_ID}, json={"activities": []}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "accepted"}
+
+    def test_client_id_is_still_checked_with_a_valid_token(
+        self, client: TestClient, db: Session, token_required: None
+    ) -> None:
+        response = client.post(
+            f"{PUSH_ENDPOINT}?token={URL_TOKEN}", headers={"garmin-client-id": "wrong"}, json={"activities": []}
+        )
+        assert response.status_code == 401
+
+    def test_non_ascii_token_is_rejected_not_an_error(
+        self, client: TestClient, db: Session, token_required: None
+    ) -> None:
+        response = client.post(
+            f"{PUSH_ENDPOINT}?token=%C3%A9t%C3%A9", headers={"garmin-client-id": VALID_CLIENT_ID}, json={}
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize("endpoint", ALL_GARMIN_ENDPOINTS)
+    def test_optional_token_accepts_and_warns_without_leaking_it(
+        self,
+        client: TestClient,
+        db: Session,
+        token_configured: None,
+        mock_external_apis: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+        endpoint: str,
+    ) -> None:
+        response = client.post(
+            f"{endpoint}?token=stale-url-token", headers={"garmin-client-id": VALID_CLIENT_ID}, json={"activities": []}
+        )
+
+        assert response.status_code == 200
+        logged = capsys.readouterr().out
+        assert "Accepted Garmin push without a valid URL token" in logged
+        assert URL_TOKEN not in logged
+        assert "stale-url-token" not in logged
+
+    def test_optional_token_accepts_the_right_one_quietly(
+        self,
+        client: TestClient,
+        db: Session,
+        token_configured: None,
+        mock_external_apis: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        response = client.post(
+            f"{PUSH_ENDPOINT}?token={URL_TOKEN}", headers={"garmin-client-id": VALID_CLIENT_ID}, json={}
+        )
+
+        assert response.status_code == 200
+        assert "without a valid URL token" not in capsys.readouterr().out
+
+    def test_no_token_configured_keeps_todays_behaviour(
+        self, client: TestClient, db: Session, mock_external_apis: dict[str, MagicMock]
+    ) -> None:
+        response = client.post(PUSH_ENDPOINT, headers={"garmin-client-id": VALID_CLIENT_ID}, json={})
+        assert response.status_code == 200
+
+    def test_access_log_masks_the_token(
+        self,
+        client: TestClient,
+        db: Session,
+        token_required: None,
+        mock_external_apis: dict[str, MagicMock],
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client.post(f"{PUSH_ENDPOINT}?token={URL_TOKEN}", headers={"garmin-client-id": VALID_CLIENT_ID}, json={})
+        assert URL_TOKEN not in capsys.readouterr().out
+
+    def test_required_without_a_token_fails_at_startup(self) -> None:
+        with pytest.raises(ValidationError, match="GARMIN_WEBHOOK_TOKEN"):
+            Settings(garmin_webhook_token_required=True, garmin_webhook_token=None)

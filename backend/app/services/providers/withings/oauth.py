@@ -64,7 +64,13 @@ class WithingsOAuth(BaseOAuthTemplate):
         return self._request_token(payload, task="exchange_token")
 
     def refresh_access_token(
-        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_failure: bool = True
+        self,
+        db: DbSession,
+        user_id: UUID,
+        refresh_token: str,
+        *,
+        revoke_on_failure: bool = True,
+        timeout: float = 30.0,
     ) -> OAuthTokenResponse:
         payload = {
             "action": "requesttoken",
@@ -74,7 +80,7 @@ class WithingsOAuth(BaseOAuthTemplate):
             "refresh_token": refresh_token,
         }
         try:
-            token_response = self._request_token(payload, task="refresh_access_token")
+            token_response = self._request_token(payload, task="refresh_access_token", timeout=timeout)
         except WithingsTokenError as exc:
             if exc.invalid_grant and revoke_on_failure:
                 self._revoke_connection(db, user_id, reason="refresh_failed")
@@ -100,14 +106,14 @@ class WithingsOAuth(BaseOAuthTemplate):
         )
         return token_response
 
-    def _request_token(self, payload: dict[str, str], *, task: str) -> OAuthTokenResponse:
+    def _request_token(self, payload: dict[str, str], *, task: str, timeout: float = 30.0) -> OAuthTokenResponse:
         """POST a token request and unwrap the Withings ``{status, body}`` envelope."""
         try:
             response = httpx.post(
                 self.endpoints.token_url,
                 data=payload,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=30.0,
+                timeout=timeout,
             )
             response.raise_for_status()
             envelope = response.json()

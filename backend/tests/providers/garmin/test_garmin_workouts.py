@@ -108,10 +108,10 @@ class TestGarminWorkouts:
 
         start_date, end_date = garmin_workouts._extract_dates(start_ts, end_ts)
 
-        assert isinstance(start_date, datetime)
-        assert isinstance(end_date, datetime)
-        assert start_date.timestamp() == start_ts
-        assert end_date.timestamp() == end_ts
+        assert start_date == datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
+        assert end_date == datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
+        assert start_date.tzinfo is timezone.utc
+        assert end_date.tzinfo is timezone.utc
 
     def test_build_metrics_with_all_values(
         self,

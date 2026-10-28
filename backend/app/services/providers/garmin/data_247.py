@@ -38,6 +38,7 @@ from app.services.providers.garmin.coverage import (
     EPOCHS_SERIES,
     NUTRITION_SERIES,
 )
+from app.services.providers.garmin.devices import GarminDeviceNames
 from app.services.providers.sync_247_result import Sync247Result
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
@@ -54,6 +55,14 @@ from app.utils.structured_logging import log_structured
 _ACTIVITY_DETAILS_SERIES_TYPES: frozenset[SeriesType] = frozenset(st for _, st in ACTIVITY_SAMPLE_SERIES) - {
     SeriesType.air_temperature
 }
+
+
+def _with_device[C: (EventRecordCreate, TimeSeriesSampleCreate)](item: C, device_names: GarminDeviceNames) -> C:
+    """``item`` filed under the canonical spelling of its device (copied only when that differs)."""
+    if not item.device_model:
+        return item
+    canonical = device_names.canonical(item.device_model)
+    return item if canonical == item.device_model else item.model_copy(update={"device_model": canonical})
 
 
 class Garmin247Data(Base247DataTemplate):
@@ -1027,27 +1036,35 @@ class Garmin247Data(Base247DataTemplate):
             user_id=user_id,
         )
 
+        # Field names as in the Activity API summary model (shared with ActivityJSON).
         distance = raw_activity.get("distanceInMeters")
         calories = raw_activity.get("activeKilocalories")
         avg_hr = raw_activity.get("averageHeartRateInBeatsPerMinute")
         max_hr = raw_activity.get("maxHeartRateInBeatsPerMinute")
-        elevation_gain = raw_activity.get("elevationGainInMeters")
+        elevation_gain = raw_activity.get("totalElevationGainInMeters")
         avg_speed = raw_activity.get("averageSpeedInMetersPerSecond")
+        max_speed = raw_activity.get("maxSpeedInMetersPerSecond")
         avg_cadence = (
             raw_activity.get("averageRunCadenceInStepsPerMinute")
-            or raw_activity.get("averageBikingCadenceInRevPerMinute")
+            or raw_activity.get("averageBikeCadenceInRoundsPerMinute")
             or raw_activity.get("averageSwimCadenceInStrokesPerMinute")
+            or raw_activity.get("averagePushCadenceInPushesPerMinute")
         )
+
+        def decimal(value: Any) -> Decimal | None:
+            return Decimal(str(value)) if value is not None else None
 
         detail = EventRecordDetailCreate(
             record_id=record_id,
-            distance=Decimal(str(distance)) if distance is not None else None,
-            energy_burned=Decimal(str(calories)) if calories is not None else None,
-            heart_rate_avg=Decimal(str(avg_hr)) if avg_hr is not None else None,
-            heart_rate_max=max_hr,
-            total_elevation_gain=Decimal(str(elevation_gain)) if elevation_gain is not None else None,
-            average_speed=Decimal(str(avg_speed)) if avg_speed is not None else None,
-            average_cadence=Decimal(str(avg_cadence)) if avg_cadence is not None else None,
+            distance=decimal(distance),
+            energy_burned=decimal(calories),
+            heart_rate_avg=decimal(avg_hr),
+            # Garmin documents max HR as floating point; the column holds whole beats.
+            heart_rate_max=round(max_hr) if max_hr is not None else None,
+            total_elevation_gain=decimal(elevation_gain),
+            average_speed=decimal(avg_speed),
+            max_speed=decimal(max_speed),
+            average_cadence=decimal(avg_cadence),
         )
 
         return record, detail
@@ -1727,6 +1744,10 @@ class Garmin247Data(Base247DataTemplate):
         offset, and the summary Garmin re-sends after an edit upserts the same rows. The individual
         loggedFoods are not stored as meals - each has a local time without an offset and no id, so
         an edited or deleted food could not be matched to what was stored.
+
+        dailyNutritionIntake is the whole day's total, so a macro it leaves out is zero for that day
+        (e.g. the user deleted the only food with fat in it). Writing 0 overwrites the total stored
+        from an earlier summary instead of leaving it behind.
         """
         recorded_at = self._from_calendar_date(raw_nutrition.get("calendarDate") or "")
         intake = raw_nutrition.get("dailyNutritionIntake")
@@ -1737,7 +1758,7 @@ class Garmin247Data(Base247DataTemplate):
         for field, series_type in NUTRITION_SERIES:
             value = intake.get(field)
             if value is None:
-                continue
+                value = 0
             samples.append(
                 TimeSeriesSampleCreate(
                     id=uuid4(),
@@ -2154,6 +2175,12 @@ class Garmin247Data(Base247DataTemplate):
                 )
 
         count = WriteCounts(0, 0)
+
+        # Garmin spells one device differently across summary types; file everything under one spelling.
+        if any(item.device_model for item in (*all_records, *all_samples)):
+            device_names = GarminDeviceNames(db, user_id, self.data_source_repo)
+            all_records = [_with_device(record, device_names) for record in all_records]
+            all_samples = [_with_device(sample, device_names) for sample in all_samples]
 
         # Single bulk insert for DataPointSeries
         if all_samples:

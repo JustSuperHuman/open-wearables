@@ -40,7 +40,6 @@ class EventRecordDetailRepository(
             creation_data["sleep_stages"] = [s.model_dump(mode="json") for s in creator.sleep_stages]
         return model(**creation_data)
 
-    @handle_exceptions
     def create(
         self,
         db_session: DbSession,
@@ -51,19 +50,30 @@ class EventRecordDetailRepository(
 
         Idempotent on record_id: returns the existing row on duplicate insert.
         """
+        detail, _ = self.create_or_get(db_session, creator, detail_type)
+        return detail
+
+    @handle_exceptions
+    def create_or_get(
+        self,
+        db_session: DbSession,
+        creator: EventRecordDetailCreate,
+        detail_type: DetailType = EventCategory.WORKOUT,
+    ) -> tuple[EventRecordDetail, bool]:
+        """Like create(), also telling whether the row was inserted (True) or already there (False)."""
         detail = self._build_detail(creator, detail_type)
         try:
             db_session.add(detail)
             db_session.commit()
             db_session.refresh(detail)
-            return detail
+            return detail, True
         except IntegrityError as exc:
             db_session.rollback()
             # record_id is the only unique index here; FK and other violations are real errors
             if isinstance(exc.orig, UniqueViolation) and (
                 existing := self.get_by_record_id(db_session, creator.record_id, detail_type)
             ):
-                return existing
+                return existing, False
             raise
 
     def create_and_flush(

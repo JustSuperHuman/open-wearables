@@ -3830,7 +3830,7 @@
           "External: Garmin Training"
         ],
         "summary": "Get Garmin Permissions",
-        "description": "Permissions the user grants this app in Garmin Connect.\n\nRead live from Garmin and stored on the connection. When Garmin can't be reached, the stored\npermissions (kept current by Garmin's userPermissionsChange pushes) are returned instead. A user\nwithout an active Garmin connection gets `connected: false` and no permissions.",
+        "description": "Permissions the user grants this app in Garmin Connect.\n\nRead live from Garmin and stored on the connection. When Garmin can't be reached (network error\nor a Garmin 5xx), the stored permissions (kept current by Garmin's userPermissionsChange pushes)\nare returned instead; a Garmin rate limit is answered as `garmin_rate_limited`. A user without\nan active Garmin connection gets `connected: false` and no permissions; `status: expired` means\nGarmin stopped accepting OW's tokens and the user has to reconnect Garmin before any write.",
         "operationId": "get_garmin_permissions_api_v1_users__user_id__garmin_permissions_get",
         "security": [
           {
@@ -3876,8 +3876,18 @@
               }
             }
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -3887,7 +3897,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -3925,6 +3935,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -3935,7 +3955,7 @@
           "External: Garmin Training"
         ],
         "summary": "Create Garmin Workout",
-        "description": "Create a workout in the user's Garmin Connect account (needs WORKOUT_IMPORT).\n\nChecked before sending: `sport` is set, at most 100 steps for a single-sport workout, and at\nmost 25 segments and 250 steps for `MULTI_SPORT`. Repeat blocks count as steps.",
+        "description": "Create a workout in the user's Garmin Connect account (needs WORKOUT_IMPORT).\n\nChecked before sending: `sport` is set, a single-sport workout has one segment and at most 100\nsteps, and `MULTI_SPORT` has at most 25 segments and 250 steps. Repeat blocks count as steps.",
         "operationId": "create_garmin_workout_api_v1_users__user_id__garmin_workouts_post",
         "security": [
           {
@@ -3952,6 +3972,26 @@
               "format": "uuid",
               "title": "User Id"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional. A unique value (e.g. a UUID) per create. Retrying with the same key within 24 h returns the original 201 response (with `Idempotent-Replayed: true`) instead of creating the object again. Only successful creates are remembered; reusing a key for a different body, or while the first request is still running, answers 409 `idempotency_conflict`.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Optional. A unique value (e.g. a UUID) per create. Retrying with the same key within 24 h returns the original 201 response (with `Idempotent-Replayed: true`) instead of creating the object again. Only successful creates are remembered; reusing a key for a different body, or while the first request is still running, answers 409 `idempotency_conflict`."
           },
           {
             "name": "X-Open-Wearables-API-Key",
@@ -3977,7 +4017,7 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": true,
-                "description": "A Garmin Training API V2 workout object. workoutProvider and workoutSourceId default to GARMIN_WORKOUT_PROVIDER when left out.",
+                "description": "A Garmin Training API V2 workout object. On create, workoutProvider and workoutSourceId default to GARMIN_WORKOUT_PROVIDER when left out.",
                 "title": "Workout"
               },
               "examples": {
@@ -4054,8 +4094,18 @@
               }
             }
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4065,7 +4115,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4103,6 +4153,26 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "idempotency_conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -4113,7 +4183,7 @@
           "External: Garmin Training"
         ],
         "summary": "Update Garmin Workout",
-        "description": "Replace a workout with a full new version (needs WORKOUT_IMPORT).\n\nGarmin requires `ownerId` on updates. Send the one from the create response; when it is left\nout, OW reads it from Garmin first, which costs one extra Garmin call.",
+        "description": "Replace a workout with a full new version (needs WORKOUT_IMPORT).\n\nGarmin requires `ownerId` on updates. Send the one from the create response; when it is left\nout, OW reads it from Garmin first, which costs one extra Garmin call. The same read keeps the\nworkout's current `workoutProvider` and `workoutSourceId` when the body leaves them out.",
         "operationId": "update_garmin_workout_api_v1_users__user_id__garmin_workouts__workout_id__put",
         "security": [
           {
@@ -4164,7 +4234,7 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": true,
-                "description": "A Garmin Training API V2 workout object. workoutProvider and workoutSourceId default to GARMIN_WORKOUT_PROVIDER when left out.",
+                "description": "A Garmin Training API V2 workout object. On create, workoutProvider and workoutSourceId default to GARMIN_WORKOUT_PROVIDER when left out.",
                 "title": "Workout"
               },
               "examples": {
@@ -4241,8 +4311,18 @@
               }
             }
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4252,7 +4332,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4283,6 +4363,16 @@
           },
           "502": {
             "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4346,8 +4436,18 @@
           "204": {
             "description": "Successful Response"
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4357,7 +4457,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4395,6 +4495,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -4422,6 +4532,26 @@
               "format": "uuid",
               "title": "User Id"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional. A unique value (e.g. a UUID) per create. Retrying with the same key within 24 h returns the original 201 response (with `Idempotent-Replayed: true`) instead of creating the object again. Only successful creates are remembered; reusing a key for a different body, or while the first request is still running, answers 409 `idempotency_conflict`.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Optional. A unique value (e.g. a UUID) per create. Retrying with the same key within 24 h returns the original 201 response (with `Idempotent-Replayed: true`) instead of creating the object again. Only successful creates are remembered; reusing a key for a different body, or while the first request is still running, answers 409 `idempotency_conflict`."
           },
           {
             "name": "X-Open-Wearables-API-Key",
@@ -4461,8 +4591,18 @@
               }
             }
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4472,7 +4612,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4503,6 +4643,26 @@
           },
           "502": {
             "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "idempotency_conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -4568,8 +4728,18 @@
           "204": {
             "description": "Successful Response"
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4579,7 +4749,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4617,6 +4787,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -4627,7 +4807,7 @@
           "External: Garmin Training"
         ],
         "summary": "Create Garmin Course",
-        "description": "Create a course (route) in the user's Garmin Connect account (needs COURSE_IMPORT).\n\nChecked before sending: a non-empty `courseName`, at least one geoPoint, and numeric\n`distance`, `elevationGain` and `elevationLoss`, which Garmin does not accept as null.",
+        "description": "Create a course (route) in the user's Garmin Connect account (needs COURSE_IMPORT).\n\nChecked before sending: a non-empty `courseName`, 1 to 10,000 geoPoints, and numeric\n`distance`, `elevationGain` and `elevationLoss`, which Garmin does not accept as null.",
         "operationId": "create_garmin_course_api_v1_users__user_id__garmin_courses_post",
         "security": [
           {
@@ -4644,6 +4824,26 @@
               "format": "uuid",
               "title": "User Id"
             }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional. A unique value (e.g. a UUID) per create. Retrying with the same key within 24 h returns the original 201 response (with `Idempotent-Replayed: true`) instead of creating the object again. Only successful creates are remembered; reusing a key for a different body, or while the first request is still running, answers 409 `idempotency_conflict`.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Optional. A unique value (e.g. a UUID) per create. Retrying with the same key within 24 h returns the original 201 response (with `Idempotent-Replayed: true`) instead of creating the object again. Only successful creates are remembered; reusing a key for a different body, or while the first request is still running, answers 409 `idempotency_conflict`."
           },
           {
             "name": "X-Open-Wearables-API-Key",
@@ -4712,8 +4912,18 @@
               }
             }
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4723,7 +4933,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4754,6 +4964,26 @@
           },
           "502": {
             "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "idempotency_conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -4819,8 +5049,18 @@
           "204": {
             "description": "Successful Response"
           },
+          "401": {
+            "description": "unauthorized (missing or invalid API key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
           "403": {
-            "description": "garmin_permission_missing",
+            "description": "garmin_permission_missing | garmin_forbidden",
             "content": {
               "application/json": {
                 "schema": {
@@ -4830,7 +5070,7 @@
             }
           },
           "404": {
-            "description": "garmin_not_connected",
+            "description": "garmin_not_connected | garmin_not_found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4861,6 +5101,16 @@
           },
           "502": {
             "description": "garmin_upstream_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GarminErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "garmin_busy (Retry-After)",
             "content": {
               "application/json": {
                 "schema": {
@@ -14253,13 +14503,27 @@
       "GarminCourseResult": {
         "properties": {
           "course_id": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Course Id",
-            "description": "Garmin courseId"
+            "description": "Garmin courseId. null only if Garmin created the course without returning an id; do not retry the create in that case, it exists in Garmin Connect."
           },
           "course": {
-            "additionalProperties": true,
-            "type": "object",
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Course",
             "description": "The course as Garmin stored it"
           }
@@ -14281,7 +14545,7 @@
           "code": {
             "type": "string",
             "title": "Code",
-            "description": "garmin_not_connected | garmin_permission_missing | garmin_rate_limited | garmin_validation_error | garmin_upstream_error"
+            "description": "garmin_not_connected | garmin_permission_missing | garmin_forbidden | garmin_not_found | garmin_rate_limited | garmin_validation_error | garmin_upstream_error | garmin_busy | idempotency_conflict | unauthorized"
           }
         },
         "type": "object",
@@ -14296,7 +14560,18 @@
           "connected": {
             "type": "boolean",
             "title": "Connected",
-            "description": "Whether the user has an active Garmin connection"
+            "description": "Whether OW can call Garmin for this user (an active Garmin connection)"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConnectionStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The Garmin connection's status: active; expired when Garmin stopped accepting OW's tokens (pushed data is still stored, but writes need the user to reconnect Garmin); revoked after a disconnect or deregistration. null when the user never connected Garmin."
           },
           "garmin_user_id": {
             "anyOf": [
@@ -14350,9 +14625,16 @@
       "GarminScheduleResult": {
         "properties": {
           "schedule_id": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Schedule Id",
-            "description": "Garmin workout schedule id"
+            "description": "Garmin workout schedule id. null only if Garmin created the schedule without returning an id."
           }
         },
         "type": "object",
@@ -14364,13 +14646,27 @@
       "GarminWorkoutResult": {
         "properties": {
           "workout_id": {
-            "type": "integer",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Workout Id",
-            "description": "Garmin workoutId"
+            "description": "Garmin workoutId. null only if Garmin created the workout without returning an id; do not retry the create in that case, it exists in Garmin Connect."
           },
           "workout": {
-            "additionalProperties": true,
-            "type": "object",
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Workout",
             "description": "The workout as Garmin stored it"
           }
